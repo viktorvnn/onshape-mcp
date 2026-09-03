@@ -8,7 +8,7 @@
 //! 3. Client redirects user to `/oauth/authorize`
 //! 4. Server redirects to Onshape OAuth, user approves
 //! 5. Onshape redirects back to `/oauth/callback`
-//! 6. Server verifies user is on the allowlist
+//! 6. Server verifies the authenticated user's identity with Onshape
 //! 7. Server issues MCP access token to the client
 //! 8. Client uses bearer token on `/mcp` requests
 //!
@@ -37,7 +37,6 @@ use tokio::sync::{Mutex, RwLock};
 
 use onshape_client_core::oauth::onshape_oauth_client;
 use onshape_mcp_core::ValidationState;
-use onshape_mcp_core::config::{AccessLevel, AllowedUser};
 
 // ============================================================================
 // Types
@@ -118,8 +117,6 @@ pub(crate) struct UserContext {
     pub onshape_tokens: UserOnshapeTokens,
     /// Validation state associated with this credential generation.
     pub validation: Arc<Mutex<ValidationState>>,
-    /// Maximum Onshape API access configured for this user.
-    pub access: AccessLevel,
 }
 
 /// Pending authorization state — stored between `/oauth/authorize` and
@@ -206,8 +203,6 @@ pub(crate) struct OAuthServerState {
     /// same refresh token twice (Onshape may invalidate the old refresh token
     /// when a new one is issued).
     refresh_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Allowlist of Onshape user IDs and their maximum API access.
-    allowed_users: HashMap<String, AccessLevel>,
     /// Onshape OAuth app client ID (operator's app).
     onshape_client_id: String,
     /// Onshape OAuth app client secret (operator's app).
@@ -503,7 +498,6 @@ impl OAuthServerState {
         onshape_client_id: String,
         onshape_client_secret: SecretString,
         onshape_company_id: Option<String>,
-        allowed_users: Vec<AllowedUser>,
         max_registered_clients: usize,
         max_pending_authorizations: usize,
     ) -> Self {
@@ -515,10 +509,6 @@ impl OAuthServerState {
             refresh_tokens: RwLock::new(HashMap::new()),
             user_credentials: RwLock::new(HashMap::new()),
             refresh_locks: RwLock::new(HashMap::new()),
-            allowed_users: allowed_users
-                .into_iter()
-                .map(|user| (user.id, user.access))
-                .collect(),
             onshape_client_id,
             onshape_client_secret,
             onshape_company_id,
@@ -552,25 +542,20 @@ impl OAuthServerState {
                 saved
                     .tokens
                     .into_iter()
-                    .filter(|(_, token)| {
-                        token.expires_at > now && self.allowed_users.contains_key(&token.user_id)
-                    })
+                    .filter(|(_, token)| token.expires_at > now)
                     .collect(),
             );
             self.refresh_tokens = RwLock::new(
                 saved
                     .refresh_tokens
                     .into_iter()
-                    .filter(|(_, token)| {
-                        token.expires_at > now && self.allowed_users.contains_key(&token.user_id)
-                    })
+                    .filter(|(_, token)| token.expires_at > now)
                     .collect(),
             );
             self.user_credentials = RwLock::new(
                 saved
                     .user_tokens
                     .into_iter()
-                    .filter(|(user_id, _)| self.allowed_users.contains_key(user_id))
                     .map(|(user_id, tokens)| {
                         (
                             user_id,
@@ -660,7 +645,6 @@ impl OAuthServerState {
         }
         let credentials = self.user_credentials.read().await.get(&user_id)?.clone();
         Some(UserContext {
-            access: *self.allowed_users.get(&user_id)?,
             user_id,
             onshape_tokens: credentials.tokens?,
             validation: credentials.validation,
@@ -1344,11 +1328,10 @@ async fn exchange_onshape_code(
     Ok((token_response, http_client))
 }
 
-/// Fetch the authenticated user's identity from Onshape and verify allowlist.
-async fn fetch_and_verify_user(
+/// Fetch the authenticated user's identity from Onshape.
+async fn fetch_authenticated_user(
     http_client: &reqwest::Client,
     access_token: &str,
-    allowed_users: &HashMap<String, AccessLevel>,
 ) -> Result<SessionInfo, (http::StatusCode, String)> {
     eprintln!("[oauth] callback: fetching user identity from Onshape");
 
@@ -1379,27 +1362,6 @@ async fn fetch_and_verify_user(
         session_info.id, session_info.name
     );
 
-    if !allowed_users.contains_key(&session_info.id) {
-        eprintln!(
-            "[oauth] callback: user {} not in allowlist, rejecting",
-            session_info.id
-        );
-        return Err((
-            http::StatusCode::FORBIDDEN,
-            format!(
-                "User {} is not authorized to use this server. \
-                 Send this ID to the server administrator to request access. \
-                 You can also find your Onshape user ID at \
-                 https://cad.onshape.com/api/v10/users/sessioninfo",
-                session_info.id
-            ),
-        ));
-    }
-
-    eprintln!(
-        "[oauth] callback: user {} is on the allowlist",
-        session_info.id
-    );
     Ok(session_info)
 }
 
@@ -1457,8 +1419,7 @@ async fn onshape_callback(
     let (token_response, http_client) =
         exchange_onshape_code(&state, onshape_code, pending.onshape_pkce_verifier).await?;
     let access_token = token_response.access_token().secret().clone();
-    let session_info =
-        fetch_and_verify_user(&http_client, &access_token, &state.allowed_users).await?;
+    let session_info = fetch_authenticated_user(&http_client, &access_token).await?;
 
     // Compute expires_at from the token response.
     let now = chrono::Utc::now();
@@ -2045,7 +2006,7 @@ mod tests {
     use onshape_mcp_core::{ValidationState, ValidationStatus};
     use sha2::Digest as _;
 
-    /// Helper: create a test `OAuthServerState` with a single allowed user.
+    /// Helper: create a test `OAuthServerState`.
     fn test_state() -> OAuthServerState {
         test_state_with_public_url("https://example.com")
     }
@@ -2056,18 +2017,6 @@ mod tests {
             "onshape-client-id".to_string(),
             SecretString::from("onshape-client-secret"),
             None,
-            vec![
-                AllowedUser {
-                    id: "allowed-user-1".to_string(),
-                    name: Some("Allowed User".to_string()),
-                    access: AccessLevel::Full,
-                },
-                AllowedUser {
-                    id: "allowed-user-2".to_string(),
-                    name: Some("Second Allowed User".to_string()),
-                    access: AccessLevel::Read,
-                },
-            ],
             100,
             100,
         )

@@ -331,8 +331,6 @@ pub(crate) struct HttpOAuthApiState {
     client: OnshapeClient,
     /// Onshape user ID (key into the shared token store).
     user_id: String,
-    /// Maximum Onshape API access granted to this user.
-    access: onshape_mcp_core::config::AccessLevel,
     /// When the current access token expires, if known.
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Shared OAuth server state (holds client credentials and token store).
@@ -631,7 +629,6 @@ impl OnshapeMcpServer {
             ApiState::HttpOAuth(Box::new(HttpOAuthApiState {
                 client,
                 user_id: user_ctx.user_id.clone(),
-                access: user_ctx.access,
                 expires_at: user_ctx.onshape_tokens.expires_at(),
                 oauth_state: Arc::clone(oauth_state),
                 base_url: self.spec.server_url().to_string(),
@@ -707,38 +704,12 @@ async fn dispatch_tool_effect(
                 request: api_req,
                 continuation,
             } => {
-                let http_audit = match state {
-                    ApiState::HttpOAuth(http_oauth) => {
-                        Some((http_oauth.user_id.clone(), http_oauth.access))
-                    }
+                let http_audit_user = match state {
+                    ApiState::HttpOAuth(http_oauth) => Some(http_oauth.user_id.clone()),
                     _ => None,
                 };
-                if let Some((user_id, access)) = &http_audit
-                    && !access.allows(&api_req.method)
-                {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "event": "onshape_api_request",
-                            "timestamp": chrono::Utc::now(),
-                            "user_id": user_id,
-                            "access": format!("{access:?}").to_lowercase(),
-                            "method": api_req.method.as_str(),
-                            "path": &api_req.path,
-                            "outcome": "denied",
-                        })
-                    );
-                    return Ok(CallToolResult::error(vec![
-                        rmcp::model::ContentBlock::text(format!(
-                            "Access denied: your server role ({:?}) does not permit {} requests. \
-                             Ask the Onshape MCP administrator for a higher access level if this \
-                             operation is required.",
-                            access, api_req.method
-                        )),
-                    ]));
-                }
                 let raw = execute_raw_api_request(state, &api_req).await;
-                if let Some((user_id, access)) = &http_audit {
+                if let Some(user_id) = &http_audit_user {
                     let (outcome, status) =
                         raw.as_ref().map_or(("transport_error", None), |response| {
                             ("completed", Some(response.status))
@@ -749,7 +720,6 @@ async fn dispatch_tool_effect(
                             "event": "onshape_api_request",
                             "timestamp": chrono::Utc::now(),
                             "user_id": user_id,
-                            "access": format!("{access:?}").to_lowercase(),
                             "method": api_req.method.as_str(),
                             "path": &api_req.path,
                             "outcome": outcome,
@@ -2048,18 +2018,6 @@ pub async fn run_http(
     {
         return Err("HTTP transport capacity limits must be greater than zero".into());
     }
-    let mut configured_user_ids = std::collections::HashSet::new();
-    for user in &config.http.allowed_users {
-        if user.id.trim().is_empty() {
-            return Err("http.allowed_users entries must have a non-empty id".into());
-        }
-        if !configured_user_ids.insert(user.id.as_str()) {
-            return Err(format!("duplicate http.allowed_users id: {}", user.id).into());
-        }
-    }
-    if config.http.production && config.http.allowed_users.is_empty() {
-        return Err("production HTTP mode requires at least one allowed user".into());
-    }
     if config.http.production
         && (config.http.state_file.is_none() || config.http.state_encryption_key.is_none())
     {
@@ -2074,13 +2032,6 @@ pub async fn run_http(
     {
         return Err("production HTTP mode requires an absolute state_file path".into());
     }
-    if config.http.allowed_users.is_empty() {
-        eprintln!(
-            "WARNING: allowed_users is empty — all users will be denied access. \
-             Configure allowed_users in the config file or via --allowed-users."
-        );
-    }
-
     // Build shared state.
     let spec = OpenApiSpec::from_json_with_server_url_fallback(
         OPENAPI_SPEC_JSON,
@@ -2095,7 +2046,6 @@ pub async fn run_http(
         onshape_client_id,
         onshape_client_secret,
         onshape_company_id,
-        config.http.allowed_users.clone(),
         config.http.max_registered_clients,
         config.http.max_pending_authorizations,
     );
@@ -2244,18 +2194,6 @@ mod tests {
             "client-id".to_string(),
             SecretString::from("client-secret"),
             None,
-            vec![
-                onshape_mcp_core::config::AllowedUser {
-                    id: "user-1".to_string(),
-                    name: None,
-                    access: onshape_mcp_core::config::AccessLevel::Read,
-                },
-                onshape_mcp_core::config::AllowedUser {
-                    id: "user-2".to_string(),
-                    name: None,
-                    access: onshape_mcp_core::config::AccessLevel::Read,
-                },
-            ],
             100,
             100,
         );

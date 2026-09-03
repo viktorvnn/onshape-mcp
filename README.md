@@ -129,10 +129,10 @@ to create a new Onshape document with a simple shape.
 
 For an engineering team, use the hardened single-server deployment in
 [`deploy/enterprise/`](deploy/enterprise/README.md). It provides TLS, per-user
-Onshape OAuth, a fail-closed user allowlist, read/write/full access levels,
-encrypted restart-persistent OAuth state, request bounds, security headers,
-health checks, and audit events. It deliberately runs one application replica;
-active-active deployment requires a transactional shared state backend.
+Onshape OAuth, equal access for every authenticated user, encrypted
+restart-persistent OAuth state, request bounds, security headers, health checks,
+and audit events. It deliberately runs one application replica; active-active
+deployment requires a transactional shared state backend.
 
 The MCP client URL is `https://<your-domain>/mcp`. This project does not provide
 a publicly operated endpoint. The operator must own the Onshape OAuth

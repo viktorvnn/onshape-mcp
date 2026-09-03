@@ -10,10 +10,10 @@ tokens survive restarts in an AES-256-GCM encrypted state file.
 - Every engineer authenticates with their own Onshape account through a
   company-owned Onshape OAuth application. The configured company ID binds the
   authorization flow to the intended Onshape enterprise.
-- The Onshape user ID must be in `ONSHAPE_ALLOWED_USERS`.
-- Users default to `read`. `write` additionally permits POST, PUT, and PATCH;
-  `full` also permits DELETE. Grant `full` only to engineers whose workflow
-  requires destructive API operations.
+- Any user who successfully completes the Onshape OAuth flow is accepted and
+  has complete Onshape API capability, including create, update, and delete
+  operations. There is no application-level user allowlist, so the server does
+  not independently verify membership in the intended enterprise.
 - MCP access and refresh tokens are audience-bound to this server's exact
   `/mcp` URL. PKCE S256 is mandatory for confidential and public clients.
 - Durable OAuth state is encrypted at rest. The encryption key and Onshape
@@ -22,8 +22,7 @@ tokens survive restarts in an AES-256-GCM encrypted state file.
 - The application container is non-root, read-only, capability-free, and not
   published directly. Only Caddy exposes ports 80 and 443.
 - HTTP security headers, request-size limits, registration/pending-flow caps,
-  fail-closed allowlisting, and JSON audit events for Onshape API calls are
-  enabled.
+  and JSON audit events for Onshape API calls are enabled.
 
 This design deliberately uses one application replica. The encrypted state
 file is safe for restart durability, not concurrent writers on shared storage.
@@ -39,6 +38,8 @@ state backend before adding replicas.
 5. A company-owned Onshape OAuth application with this exact redirect URI:
    `https://<MCP_DOMAIN>/oauth/callback`.
 6. The Onshape enterprise company ID configured for the integrated application.
+7. Confirmation from the Onshape administrator that the OAuth application and
+   enterprise policy permit only the accounts that should use this server.
 
 Company-owned Onshape OAuth applications count against the company's API
 limits. Confirm expected usage and annual limits with the Onshape administrator
@@ -55,18 +56,6 @@ openssl rand -base64 32 > secrets/state-encryption-key
 printf '%s' 'replace-with-onshape-client-secret' > secrets/onshape-client-secret
 sudo chown 10001:10001 secrets/state-encryption-key secrets/onshape-client-secret
 sudo chmod 600 secrets/state-encryption-key secrets/onshape-client-secret
-```
-
-Edit `.env`. The allowlist format is:
-
-```text
-id[:display-name[:read|write|full]],id2[:display-name[:read|write|full]]
-```
-
-Examples:
-
-```text
-abc123:Alice:read,def456:Bob:write,ghi789:Release Engineer:full
 ```
 
 Keep `.env` and `secrets/` out of source control. Store copies of both secrets
@@ -92,16 +81,15 @@ MCP transport rejects other authorities to prevent DNS rebinding.
 
 - Stream logs with `docker compose logs -f`. Application audit records use the
   event name `onshape_api_request` and include timestamp, Onshape user ID,
-  configured access level, method, path, outcome, and upstream status. They do
+  method, path, outcome, and upstream status. They do
   not include request bodies, query parameters, OAuth tokens, or Authorization
   headers. Caddy redacts credential headers by default, and this deployment
   additionally redacts OAuth `code` and `state` query values from access logs.
 - Back up the `oauth-state` Docker volume and the encryption key separately.
   Test restore procedures. A state backup without its matching key is unusable.
-- To revoke a user immediately, remove their allowlist entry and restart the
-  service. Runtime bearer validation re-checks the current allowlist, so removed
-  users are denied after restart even if old tokens remain in encrypted state.
-  Also revoke the OAuth grant in Onshape when offboarding requires it.
+- Revoke OAuth access in Onshape when offboarding a user. Because the server has
+  no local user allowlist, access control and revocation are managed through the
+  Onshape OAuth application and the company's Onshape administration.
 - Changing the state encryption key without re-encrypting the existing file
   intentionally fails startup. For simple key rotation, stop the service,
   archive the old state and key under the retention policy, generate a new key,
@@ -119,8 +107,9 @@ original `Host` header.
 ## Production acceptance checklist
 
 - TLS certificate and callback URI match the configured public URL exactly.
-- Only approved Onshape user IDs can complete authorization.
-- A read user cannot POST/PUT/PATCH/DELETE; a write user cannot DELETE.
+- A company test account can complete OAuth and read and modify Onshape data.
+- If access should be company-only, an account outside the intended enterprise
+  cannot complete authorization under the configured Onshape policy.
 - Restarting `onshape-mcp` preserves an existing client's refresh flow.
 - The encrypted state file contains no recognizable token plaintext and is mode
   0600 inside the container.

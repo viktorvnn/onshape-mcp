@@ -310,10 +310,9 @@ sequenceDiagram
     Server->>Onshape: POST /oauth/token<br>(exchange onshape_code +<br>server's PKCE verifier)
     Onshape-->>Server: { access_token, refresh_token,<br>  expires_in }
 
-    Note over Server: User verification
+    Note over Server: User identification
     Server->>Onshape: GET /api/v10/users/sessioninfo<br>Authorization: Bearer <onshape_token>
     Onshape-->>Server: { id: "<user_id>", ... }
-    Server->>Server: Check user_id ∈ allowed_users
 
     Note over Server: Issue MCP credentials
     Server->>Server: Store Onshape tokens<br>keyed by user_id

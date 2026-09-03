@@ -79,17 +79,13 @@ max_request_body_bytes = 16777216
 max_registered_clients = 1000
 max_pending_authorizations = 256
 
-[[http.allowed_users]]
-id = "onshape-user-id"
-name = "Optional display name"
-access = "read"
 ```
 
 `public_url` is the origin without `/mcp`, a query, or fragment. Clients use
 `https://mcp.example.com/mcp`. Production deployments commonly bind
-`0.0.0.0` behind TLS termination. An empty `allowed_users` list denies all
-users. Production mode also requires a non-empty allowlist, an absolute state
-file path, and an encryption key. Prefer the `_FILE` environment variables
+`0.0.0.0` behind TLS termination. Any user who completes Onshape OAuth can use
+the server. Production mode requires an absolute state file path and an
+encryption key. Prefer the `_FILE` environment variables
 documented by the [enterprise deployment](../../../deploy/enterprise/README.md)
 for secrets instead of placing them directly in configuration. No public
 deployment is provided.
@@ -127,8 +123,7 @@ All environment variables use the `ONSHAPE_MCP_` prefix.
 | HTTP Onshape Client ID | `string` | — | `ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_ID` | `http.onshape_client_id` | `http --onshape-client-id` | Required operator-owned OAuth client ID |
 | HTTP Onshape Client Secret | `string` | — | `ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET` | `http.onshape_client_secret` | `http --onshape-client-secret` | Required operator-owned OAuth client secret |
 | HTTP Onshape Company ID | `string` | — | `ONSHAPE_MCP_HTTP__ONSHAPE_COMPANY_ID` | `http.onshape_company_id` | — | Optional enterprise company binding for Onshape authorization |
-| HTTP Allowed Users | user list | empty (deny all) | `ONSHAPE_MCP_HTTP__ALLOWED_USERS` | `http.allowed_users` | `http --allowed-users` | Onshape IDs and access; env/CLI accepts `id:name:read,id2:name:write` |
-| HTTP Production Checks | `bool` | `false` | `ONSHAPE_MCP_HTTP__PRODUCTION` | `http.production` | — | Require HTTPS, users, encrypted durable state, and absolute state path |
+| HTTP Production Checks | `bool` | `false` | `ONSHAPE_MCP_HTTP__PRODUCTION` | `http.production` | — | Require HTTPS, encrypted durable state, and an absolute state path |
 | HTTP State File | path | — | `ONSHAPE_MCP_HTTP__STATE_FILE` | `http.state_file` | — | Encrypted OAuth client, grant, token, and per-user Onshape state |
 | HTTP State Key | base64 | — | `ONSHAPE_MCP_HTTP__STATE_ENCRYPTION_KEY` or `ONSHAPE_MCP_HTTP__STATE_ENCRYPTION_KEY_FILE` | `http.state_encryption_key` | — | Base64-encoded 32-byte AES-GCM key |
 | HTTP Onshape Secret File | path | — | `ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET_FILE` | — | — | Absolute path to operator OAuth client secret; overrides direct value |

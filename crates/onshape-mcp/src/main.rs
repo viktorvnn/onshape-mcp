@@ -51,7 +51,7 @@ enum Command {
         #[command(subcommand)]
         action: AuthCommand,
     },
-    /// Run the experimental MCP server over self-hosted Streamable HTTP transport.
+    /// Run the MCP server over self-hosted Streamable HTTP transport.
     ///
     /// Serves the MCP endpoint at `/mcp` with per-user OAuth authentication
     /// via Onshape. Requires `public_url`, `onshape_client_id`, and
@@ -77,9 +77,9 @@ enum Command {
         #[arg(long)]
         onshape_client_secret: Option<String>,
 
-        /// Comma-separated list of allowed users (id:name pairs).
+        /// Comma-separated users: id[:name[:read|write|full]].
         ///
-        /// Overrides config file. Example: `--allowed-users "abc123:Alice,def456:Bob"`
+        /// Overrides config. Example: `--allowed-users "abc123:Alice:read,def456:Bob:write"`
         #[arg(long)]
         allowed_users: Option<String>,
     },

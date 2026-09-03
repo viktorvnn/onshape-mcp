@@ -12,11 +12,17 @@
 //! 7. Server issues MCP access token to the client
 //! 8. Client uses bearer token on `/mcp` requests
 //!
-//! All session state is in-memory. Server restarts invalidate all sessions.
+//! Development mode can keep state in memory. Production deployments persist
+//! OAuth clients, authorization codes, user credentials, and issued tokens in
+//! an AES-256-GCM encrypted state file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect};
 use axum::{Json, Router, middleware, routing};
@@ -31,6 +37,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use onshape_client_core::oauth::onshape_oauth_client;
 use onshape_mcp_core::ValidationState;
+use onshape_mcp_core::config::{AccessLevel, AllowedUser};
 
 // ============================================================================
 // Types
@@ -111,6 +118,8 @@ pub(crate) struct UserContext {
     pub onshape_tokens: UserOnshapeTokens,
     /// Validation state associated with this credential generation.
     pub validation: Arc<Mutex<ValidationState>>,
+    /// Maximum Onshape API access configured for this user.
+    pub access: AccessLevel,
 }
 
 /// Pending authorization state — stored between `/oauth/authorize` and
@@ -126,21 +135,26 @@ struct PendingAuth {
     /// The CSRF state token from the MCP client's auth request.
     /// `None` when the client omitted the optional `state` parameter.
     mcp_state: Option<String>,
+    /// Canonical MCP resource requested by the client (RFC 8707).
+    resource: String,
     /// PKCE verifier for the Onshape leg of the flow.
     onshape_pkce_verifier: PkceCodeVerifier,
+    /// When this flow began, for expiry and resource-bound cleanup.
+    created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A dynamically registered MCP client.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct RegisteredClient {
     #[allow(dead_code)]
     client_id: String,
-    client_secret: String,
+    client_secret: Option<String>,
     redirect_uris: Vec<String>,
+    token_endpoint_auth_method: String,
 }
 
 /// An issued MCP authorization code.
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct IssuedAuthCode {
     /// The MCP client this code was issued for.
     client_id: String,
@@ -150,17 +164,21 @@ struct IssuedAuthCode {
     pkce_code_challenge: Option<String>,
     /// Onshape user ID associated with this code.
     user_id: String,
+    /// Canonical MCP resource this code is valid for (RFC 8707).
+    resource: String,
     /// When this code was issued (used to enforce [`AUTH_CODE_TTL_SECS`]).
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// An issued MCP access token → user mapping.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct IssuedToken {
     /// Onshape user ID.
     user_id: String,
     /// The client that this token was issued for.
     client_id: String,
+    /// Canonical MCP resource this token is valid for (RFC 8707).
+    resource: String,
     /// When the token was issued.
     #[allow(dead_code)]
     issued_at: chrono::DateTime<chrono::Utc>,
@@ -188,14 +206,246 @@ pub(crate) struct OAuthServerState {
     /// same refresh token twice (Onshape may invalidate the old refresh token
     /// when a new one is issued).
     refresh_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// Allowlist of Onshape user IDs.
-    allowed_users: HashSet<String>,
+    /// Allowlist of Onshape user IDs and their maximum API access.
+    allowed_users: HashMap<String, AccessLevel>,
     /// Onshape OAuth app client ID (operator's app).
     onshape_client_id: String,
     /// Onshape OAuth app client secret (operator's app).
     onshape_client_secret: SecretString,
+    /// Optional enterprise company to bind into the Onshape authorization flow.
+    onshape_company_id: Option<String>,
     /// Public URL of this MCP server (validated at construction time).
     public_url: url::Url,
+    /// Optional encrypted durable state for production deployments.
+    persistence: Option<EncryptedStateStore>,
+    /// Hard cap on DCR records to bound unauthenticated resource consumption.
+    max_registered_clients: usize,
+    /// Hard cap on simultaneous authorization flows.
+    max_pending_authorizations: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PersistedUserTokens {
+    access_token: String,
+    refresh_token: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct PersistedOAuthState {
+    version: u8,
+    clients: HashMap<String, RegisteredClient>,
+    auth_codes: HashMap<String, IssuedAuthCode>,
+    tokens: HashMap<String, IssuedToken>,
+    refresh_tokens: HashMap<String, IssuedToken>,
+    user_tokens: HashMap<String, PersistedUserTokens>,
+}
+
+#[derive(Debug)]
+struct EncryptedStateStore {
+    path: PathBuf,
+    key: [u8; 32],
+    write_lock: Mutex<()>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StateStoreError {
+    #[error("state encryption key must be standard base64 encoding of exactly 32 bytes")]
+    InvalidKey,
+    #[error("failed to read encrypted OAuth state {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("encrypted OAuth state {path} has an invalid format")]
+    InvalidFormat { path: String },
+    #[error("failed to decrypt encrypted OAuth state {path}; verify the configured key")]
+    Decrypt { path: String },
+    #[error("failed to parse encrypted OAuth state {path}: {source}")]
+    Parse {
+        path: String,
+        source: serde_json::Error,
+    },
+    #[error("failed to serialize OAuth state: {0}")]
+    Serialize(serde_json::Error),
+    #[error("failed to encrypt OAuth state")]
+    Encrypt,
+    #[error("failed to write encrypted OAuth state {path}: {source}")]
+    Write {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("encrypted OAuth state file permission check failed: {0}")]
+    Permissions(String),
+}
+
+const STATE_MAGIC: &[u8] = b"OSMCP1\0";
+const STATE_AAD: &[u8] = b"onshape-mcp-oauth-state-v1";
+const STATE_NONCE_BYTES: usize = 12;
+#[cfg(windows)]
+const STATE_REPLACE_RETRY: std::time::Duration = std::time::Duration::from_millis(25);
+#[cfg(windows)]
+const STATE_REPLACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[cfg(not(windows))]
+fn persist_encrypted_state_file(
+    file: tempfile::NamedTempFile,
+    path: &Path,
+) -> Result<(), StateStoreError> {
+    file.persist(path).map_err(|error| StateStoreError::Write {
+        path: path.display().to_string(),
+        source: error.error,
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn persist_encrypted_state_file(
+    mut file: tempfile::NamedTempFile,
+    path: &Path,
+) -> Result<(), StateStoreError> {
+    let deadline = std::time::Instant::now() + STATE_REPLACE_TIMEOUT;
+    loop {
+        match file.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(error)
+                if error.error.kind() == std::io::ErrorKind::PermissionDenied
+                    && std::time::Instant::now() < deadline =>
+            {
+                file = error.file;
+                std::thread::sleep(STATE_REPLACE_RETRY);
+            }
+            Err(error) => {
+                return Err(StateStoreError::Write {
+                    path: path.display().to_string(),
+                    source: error.error,
+                });
+            }
+        }
+    }
+}
+
+impl EncryptedStateStore {
+    fn new(path: PathBuf, encoded_key: &str) -> Result<Self, StateStoreError> {
+        use base64::Engine as _;
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded_key.trim())
+            .map_err(|_| StateStoreError::InvalidKey)?;
+        let key: [u8; 32] = decoded
+            .try_into()
+            .map_err(|_| StateStoreError::InvalidKey)?;
+        Ok(Self {
+            path,
+            key,
+            write_lock: Mutex::new(()),
+        })
+    }
+
+    fn load(&self) -> Result<Option<PersistedOAuthState>, StateStoreError> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        crate::config::check_file_permissions(&self.path)
+            .map_err(|error| StateStoreError::Permissions(error.to_string()))?;
+        let mut content = Vec::new();
+        std::fs::File::open(&self.path)
+            .and_then(|mut file| file.read_to_end(&mut content))
+            .map_err(|source| StateStoreError::Read {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        if content.len() <= STATE_MAGIC.len() + STATE_NONCE_BYTES
+            || !content.starts_with(STATE_MAGIC)
+        {
+            return Err(StateStoreError::InvalidFormat {
+                path: self.path.display().to_string(),
+            });
+        }
+        let nonce_start = STATE_MAGIC.len();
+        let ciphertext_start = nonce_start + STATE_NONCE_BYTES;
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| StateStoreError::InvalidKey)?;
+        let plaintext = cipher
+            .decrypt(
+                Nonce::from_slice(&content[nonce_start..ciphertext_start]),
+                Payload {
+                    msg: &content[ciphertext_start..],
+                    aad: STATE_AAD,
+                },
+            )
+            .map_err(|_| StateStoreError::Decrypt {
+                path: self.path.display().to_string(),
+            })?;
+        let state: PersistedOAuthState =
+            serde_json::from_slice(&plaintext).map_err(|source| StateStoreError::Parse {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        if state.version != 1 {
+            return Err(StateStoreError::InvalidFormat {
+                path: self.path.display().to_string(),
+            });
+        }
+        Ok(Some(state))
+    }
+
+    fn save(&self, state: &PersistedOAuthState) -> Result<(), StateStoreError> {
+        let plaintext = serde_json::to_vec(state).map_err(StateStoreError::Serialize)?;
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| StateStoreError::InvalidKey)?;
+        let mut nonce = [0_u8; STATE_NONCE_BYTES];
+        rand::rng().fill(&mut nonce);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &plaintext,
+                    aad: STATE_AAD,
+                },
+            )
+            .map_err(|_| StateStoreError::Encrypt)?;
+        let mut content = Vec::with_capacity(STATE_MAGIC.len() + nonce.len() + ciphertext.len());
+        content.extend_from_slice(STATE_MAGIC);
+        content.extend_from_slice(&nonce);
+        content.extend_from_slice(&ciphertext);
+
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| StateStoreError::Write {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        }
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let prefix = format!(
+            ".{}.tmp-",
+            self.path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        let mut file = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempfile_in(parent)
+            .map_err(|source| StateStoreError::Write {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|source| StateStoreError::Write {
+                    path: self.path.display().to_string(),
+                    source,
+                })?;
+        }
+        file.write_all(&content)
+            .and_then(|()| file.as_file().sync_all())
+            .map_err(|source| StateStoreError::Write {
+                path: self.path.display().to_string(),
+                source,
+            })?;
+        persist_encrypted_state_file(file, &self.path)
+    }
 }
 
 /// Errors that can occur during per-user Onshape token refresh.
@@ -220,6 +470,9 @@ const TOKEN_LIFETIME_SECS: i64 = 3600;
 
 /// Maximum lifetime of an authorization code (RFC 6749 §4.1.2 recommends ≤10 min).
 const AUTH_CODE_TTL_SECS: i64 = 600;
+
+/// Maximum lifetime of the Onshape browser authorization leg.
+const PENDING_AUTH_TTL_SECS: i64 = 600;
 
 /// Remove any existing tokens for the given user+client pair, then insert the new one.
 ///
@@ -249,7 +502,10 @@ impl OAuthServerState {
         public_url: url::Url,
         onshape_client_id: String,
         onshape_client_secret: SecretString,
-        allowed_user_ids: Vec<String>,
+        onshape_company_id: Option<String>,
+        allowed_users: Vec<AllowedUser>,
+        max_registered_clients: usize,
+        max_pending_authorizations: usize,
     ) -> Self {
         Self {
             clients: RwLock::new(HashMap::new()),
@@ -259,11 +515,114 @@ impl OAuthServerState {
             refresh_tokens: RwLock::new(HashMap::new()),
             user_credentials: RwLock::new(HashMap::new()),
             refresh_locks: RwLock::new(HashMap::new()),
-            allowed_users: allowed_user_ids.into_iter().collect(),
+            allowed_users: allowed_users
+                .into_iter()
+                .map(|user| (user.id, user.access))
+                .collect(),
             onshape_client_id,
             onshape_client_secret,
+            onshape_company_id,
             public_url,
+            persistence: None,
+            max_registered_clients,
+            max_pending_authorizations,
         }
+    }
+
+    /// Enable encrypted durable OAuth state and load an existing state file.
+    pub(crate) fn with_encrypted_persistence(
+        mut self,
+        path: PathBuf,
+        encoded_key: &str,
+    ) -> Result<Self, StateStoreError> {
+        let store = EncryptedStateStore::new(path, encoded_key)?;
+        if let Some(saved) = store.load()? {
+            let now = chrono::Utc::now();
+            self.clients = RwLock::new(saved.clients);
+            self.auth_codes = RwLock::new(
+                saved
+                    .auth_codes
+                    .into_iter()
+                    .filter(|(_, code)| {
+                        code.created_at + chrono::Duration::seconds(AUTH_CODE_TTL_SECS) > now
+                    })
+                    .collect(),
+            );
+            self.tokens = RwLock::new(
+                saved
+                    .tokens
+                    .into_iter()
+                    .filter(|(_, token)| {
+                        token.expires_at > now && self.allowed_users.contains_key(&token.user_id)
+                    })
+                    .collect(),
+            );
+            self.refresh_tokens = RwLock::new(
+                saved
+                    .refresh_tokens
+                    .into_iter()
+                    .filter(|(_, token)| {
+                        token.expires_at > now && self.allowed_users.contains_key(&token.user_id)
+                    })
+                    .collect(),
+            );
+            self.user_credentials = RwLock::new(
+                saved
+                    .user_tokens
+                    .into_iter()
+                    .filter(|(user_id, _)| self.allowed_users.contains_key(user_id))
+                    .map(|(user_id, tokens)| {
+                        (
+                            user_id,
+                            UserCredentials::new(UserOnshapeTokens::new(
+                                SecretString::from(tokens.access_token),
+                                SecretString::from(tokens.refresh_token),
+                                tokens.expires_at,
+                            )),
+                        )
+                    })
+                    .collect(),
+            );
+        }
+        self.persistence = Some(store);
+        Ok(self)
+    }
+
+    async fn persist(&self) -> Result<(), StateStoreError> {
+        let Some(store) = &self.persistence else {
+            return Ok(());
+        };
+        let _guard = store.write_lock.lock().await;
+        let clients = self.clients.read().await.clone();
+        let auth_codes = self.auth_codes.read().await.clone();
+        let tokens = self.tokens.read().await.clone();
+        let refresh_tokens = self.refresh_tokens.read().await.clone();
+        let user_tokens = self
+            .user_credentials
+            .read()
+            .await
+            .iter()
+            .filter_map(|(user_id, credentials)| {
+                credentials.tokens.as_ref().map(|tokens| {
+                    (
+                        user_id.clone(),
+                        PersistedUserTokens {
+                            access_token: tokens.access_token().expose_secret().to_string(),
+                            refresh_token: tokens.refresh_token().expose_secret().to_string(),
+                            expires_at: tokens.expires_at(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        store.save(&PersistedOAuthState {
+            version: 1,
+            clients,
+            auth_codes,
+            tokens,
+            refresh_tokens,
+            user_tokens,
+        })
     }
 
     /// Build a URL by extending the public URL's path with additional segments.
@@ -285,17 +644,23 @@ impl OAuthServerState {
 
     /// Validate a bearer token and return the user context if valid.
     pub(crate) async fn validate_token(&self, token: &str) -> Option<UserContext> {
-        let (user_id, expires_at) = self
-            .tokens
-            .read()
-            .await
-            .get(token)
-            .map(|issued| (issued.user_id.clone(), issued.expires_at))?;
+        let (user_id, expires_at, resource) =
+            self.tokens.read().await.get(token).map(|issued| {
+                (
+                    issued.user_id.clone(),
+                    issued.expires_at,
+                    issued.resource.clone(),
+                )
+            })?;
         if chrono::Utc::now() > expires_at {
+            return None;
+        }
+        if resource != self.url_with_path(&["mcp"]) {
             return None;
         }
         let credentials = self.user_credentials.read().await.get(&user_id)?.clone();
         Some(UserContext {
+            access: *self.allowed_users.get(&user_id)?,
             user_id,
             onshape_tokens: credentials.tokens?,
             validation: credentials.validation,
@@ -315,22 +680,33 @@ impl OAuthServerState {
     }
 
     /// Store refreshed credentials while preserving the active validation slot.
-    async fn store_refreshed_user_tokens(&self, user_id: &str, tokens: UserOnshapeTokens) {
+    async fn store_refreshed_user_tokens(
+        &self,
+        user_id: &str,
+        tokens: UserOnshapeTokens,
+    ) -> Result<(), StateStoreError> {
         let mut credentials = self.user_credentials.write().await;
         credentials
             .entry(user_id.to_string())
             .and_modify(|credentials| credentials.tokens = Some(tokens.clone()))
             .or_insert_with(|| UserCredentials::new(tokens));
+        drop(credentials);
+        self.persist().await
     }
 
     /// Store explicitly reauthorized credentials and invalidate old validation.
-    async fn replace_reauthorized_user_tokens(&self, user_id: &str, tokens: UserOnshapeTokens) {
+    async fn replace_reauthorized_user_tokens(
+        &self,
+        user_id: &str,
+        tokens: UserOnshapeTokens,
+    ) -> Result<(), StateStoreError> {
         let lock = self.get_user_refresh_lock(user_id).await;
         let _guard = lock.lock().await;
         self.user_credentials
             .write()
             .await
             .insert(user_id.to_string(), UserCredentials::new(tokens));
+        self.persist().await
     }
 
     /// Refresh a user's Onshape tokens using the server's client credentials.
@@ -427,7 +803,8 @@ impl OAuthServerState {
 
         // Update stored tokens.
         self.store_refreshed_user_tokens(user_id, new_tokens.clone())
-            .await;
+            .await
+            .map_err(|error| UserTokenRefreshError::Exchange(error.to_string()))?;
 
         eprintln!("[oauth] Onshape token refresh succeeded for user {user_id}");
 
@@ -492,6 +869,14 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+/// Readiness endpoint for load balancers and container orchestrators.
+async fn ready(State(state): State<Arc<OAuthServerState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ready",
+        "durable_oauth_state": state.persistence.is_some(),
+    }))
+}
+
 /// RFC 9728: Protected Resource Metadata.
 ///
 /// `GET /.well-known/oauth-protected-resource`
@@ -518,7 +903,7 @@ async fn authorization_server_metadata(
         "registration_endpoint": state.url_with_path(&["oauth", "register"]),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": [],
     }))
@@ -537,7 +922,6 @@ struct RegisterRequest {
     grant_types: Vec<String>,
     #[serde(default)]
     response_types: Vec<String>,
-    #[allow(dead_code)]
     token_endpoint_auth_method: Option<String>,
 }
 
@@ -545,7 +929,10 @@ struct RegisterRequest {
 #[derive(Debug, Serialize)]
 struct RegisterResponse {
     client_id: String,
-    client_secret: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_secret_expires_at: Option<u64>,
     client_name: Option<String>,
     redirect_uris: Vec<String>,
     grant_types: Vec<String>,
@@ -606,6 +993,7 @@ fn validate_redirect_uris(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn register_client(
     State(state): State<Arc<OAuthServerState>>,
     Json(req): Json<RegisterRequest>,
@@ -668,31 +1056,66 @@ async fn register_client(
         req.response_types
     };
 
+    let token_endpoint_auth_method = req.token_endpoint_auth_method.as_deref().unwrap_or("none");
+    if !matches!(token_endpoint_auth_method, "none" | "client_secret_post") {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_client_metadata",
+                "error_description": format!(
+                    "unsupported token_endpoint_auth_method: {token_endpoint_auth_method}"
+                ),
+            })),
+        ));
+    }
+
     let client_id = random_hex(16);
-    let client_secret = random_hex(32);
+    let client_secret =
+        (token_endpoint_auth_method == "client_secret_post").then(|| random_hex(32));
 
     let registered = RegisteredClient {
         client_id: client_id.clone(),
         client_secret: client_secret.clone(),
         redirect_uris: req.redirect_uris.clone(),
+        token_endpoint_auth_method: token_endpoint_auth_method.to_string(),
     };
 
-    state
-        .clients
-        .write()
-        .await
-        .insert(client_id.clone(), registered);
+    {
+        let mut clients = state.clients.write().await;
+        if clients.len() >= state.max_registered_clients {
+            return Err((
+                http::StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": "temporarily_unavailable",
+                    "error_description": "dynamic client registration capacity reached",
+                })),
+            ));
+        }
+        clients.insert(client_id.clone(), registered);
+    }
+    if let Err(error) = state.persist().await {
+        state.clients.write().await.remove(&client_id);
+        eprintln!("[oauth] DCR: failed to persist registered client: {error}");
+        return Err((
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "server_error",
+                "error_description": "failed to persist client registration",
+            })),
+        ));
+    }
 
     eprintln!("[oauth] DCR: issued client_id={client_id}");
 
     Ok(Json(RegisterResponse {
         client_id,
         client_secret,
+        client_secret_expires_at: (token_endpoint_auth_method == "client_secret_post").then_some(0),
         client_name: req.client_name,
         redirect_uris: req.redirect_uris,
         grant_types,
         response_types,
-        token_endpoint_auth_method: "client_secret_post".to_string(),
+        token_endpoint_auth_method: token_endpoint_auth_method.to_string(),
     }))
 }
 
@@ -709,10 +1132,12 @@ struct AuthorizeParams {
     state: Option<String>,
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
+    resource: Option<String>,
     #[allow(dead_code)]
     scope: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn authorize(
     State(state): State<Arc<OAuthServerState>>,
     Query(params): Query<AuthorizeParams>,
@@ -731,6 +1156,15 @@ async fn authorize(
         return Err((
             http::StatusCode::BAD_REQUEST,
             "unsupported response_type".to_string(),
+        ));
+    }
+
+    let expected_resource = state.url_with_path(&["mcp"]);
+    if params.resource.as_deref() != Some(expected_resource.as_str()) {
+        eprintln!("[oauth] authorize: rejected missing or invalid resource");
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            format!("resource must be {expected_resource}"),
         ));
     }
 
@@ -788,13 +1222,24 @@ async fn authorize(
         redirect_uri: params.redirect_uri.clone(),
         pkce_code_challenge,
         mcp_state: params.state.clone(),
+        resource: expected_resource,
         onshape_pkce_verifier,
+        created_at: chrono::Utc::now(),
     };
-    state
-        .pending_auth
-        .write()
-        .await
-        .insert(onshape_csrf.secret().clone(), pending);
+    {
+        let now = chrono::Utc::now();
+        let mut pending_auth = state.pending_auth.write().await;
+        pending_auth.retain(|_, auth| {
+            auth.created_at + chrono::Duration::seconds(PENDING_AUTH_TTL_SECS) > now
+        });
+        if pending_auth.len() >= state.max_pending_authorizations {
+            return Err((
+                http::StatusCode::TOO_MANY_REQUESTS,
+                "too many pending authorization flows; retry later".to_string(),
+            ));
+        }
+        pending_auth.insert(onshape_csrf.secret().clone(), pending);
+    }
 
     // Build the Onshape authorization URL.
     let onshape_client = onshape_oauth_client(
@@ -809,13 +1254,16 @@ async fn authorize(
         )
     })?;
 
-    let (auth_url, _) = onshape_client
-        .set_redirect_uri(redirect_url)
+    let onshape_client = onshape_client.set_redirect_uri(redirect_url);
+    let mut auth_request = onshape_client
         .authorize_url(|| onshape_csrf)
         .set_pkce_challenge(onshape_pkce_challenge)
         .add_scope(Scope::new("OAuth2Read".to_string()))
-        .add_scope(Scope::new("OAuth2Write".to_string()))
-        .url();
+        .add_scope(Scope::new("OAuth2Write".to_string()));
+    if let Some(company_id) = &state.onshape_company_id {
+        auth_request = auth_request.add_extra_param("company_id", company_id);
+    }
+    let (auth_url, _) = auth_request.url();
 
     Ok(Redirect::to(auth_url.as_str()))
 }
@@ -900,7 +1348,7 @@ async fn exchange_onshape_code(
 async fn fetch_and_verify_user(
     http_client: &reqwest::Client,
     access_token: &str,
-    allowed_users: &HashSet<String>,
+    allowed_users: &HashMap<String, AccessLevel>,
 ) -> Result<SessionInfo, (http::StatusCode, String)> {
     eprintln!("[oauth] callback: fetching user identity from Onshape");
 
@@ -931,7 +1379,7 @@ async fn fetch_and_verify_user(
         session_info.id, session_info.name
     );
 
-    if !allowed_users.contains(&session_info.id) {
+    if !allowed_users.contains_key(&session_info.id) {
         eprintln!(
             "[oauth] callback: user {} not in allowlist, rejecting",
             session_info.id
@@ -955,6 +1403,7 @@ async fn fetch_and_verify_user(
     Ok(session_info)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn onshape_callback(
     State(state): State<Arc<OAuthServerState>>,
     Query(params): Query<CallbackParams>,
@@ -992,6 +1441,12 @@ async fn onshape_callback(
             "unknown or expired state".to_string(),
         ));
     };
+    if pending.created_at + chrono::Duration::seconds(PENDING_AUTH_TTL_SECS) <= chrono::Utc::now() {
+        return Err((
+            http::StatusCode::BAD_REQUEST,
+            "unknown or expired state".to_string(),
+        ));
+    }
 
     eprintln!(
         "[oauth] callback: matched pending auth for client_id={}",
@@ -1026,7 +1481,14 @@ async fn onshape_callback(
                 expires_at,
             ),
         )
-        .await;
+        .await
+        .map_err(|error| {
+            eprintln!("[oauth] callback: failed to persist user credentials: {error}");
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to persist authorization state".to_string(),
+            )
+        })?;
 
     // Issue an MCP authorization code.
     let mcp_code = random_hex(32);
@@ -1037,9 +1499,17 @@ async fn onshape_callback(
             redirect_uri: pending.redirect_uri.clone(),
             pkce_code_challenge: pending.pkce_code_challenge,
             user_id: session_info.id.clone(),
+            resource: pending.resource,
             created_at: chrono::Utc::now(),
         },
     );
+    state.persist().await.map_err(|error| {
+        eprintln!("[oauth] callback: failed to persist authorization code: {error}");
+        (
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist authorization state".to_string(),
+        )
+    })?;
 
     eprintln!(
         "[oauth] callback: issued MCP auth code for user {}, redirecting to MCP client",
@@ -1078,6 +1548,7 @@ struct TokenRequest {
     client_secret: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
+    resource: Option<String>,
 }
 
 /// Response for `POST /oauth/token`.
@@ -1109,6 +1580,48 @@ async fn token_endpoint(
     }
 }
 
+fn validate_client_auth(
+    registered: &RegisteredClient,
+    provided_secret: Option<&str>,
+) -> Result<(), (http::StatusCode, Json<serde_json::Value>)> {
+    match registered.token_endpoint_auth_method.as_str() {
+        "none" => {
+            if provided_secret.is_some_and(|secret| !secret.is_empty()) {
+                Err(token_error(
+                    "invalid_client",
+                    "public client must not send client_secret",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        "client_secret_post" => {
+            let Some(expected_secret) = registered.client_secret.as_deref() else {
+                return Err(token_error(
+                    "invalid_client",
+                    "client secret is unavailable",
+                ));
+            };
+            let Some(provided_secret) = provided_secret else {
+                return Err(token_error("invalid_client", "missing client_secret"));
+            };
+            if provided_secret
+                .as_bytes()
+                .ct_ne(expected_secret.as_bytes())
+                .into()
+            {
+                Err(token_error("invalid_client", "invalid client_secret"))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(token_error(
+            "invalid_client",
+            "unsupported registered client authentication method",
+        )),
+    }
+}
+
 async fn handle_auth_code_grant(
     state: &OAuthServerState,
     req: &TokenRequest,
@@ -1120,8 +1633,8 @@ async fn handle_auth_code_grant(
         return Err(token_error("invalid_request", "missing code"));
     };
 
-    // Look up and consume the authorization code.
-    let Some(issued_code) = state.auth_codes.write().await.remove(code.as_str()) else {
+    // Look up the authorization code. Consume it only after all binding checks pass.
+    let Some(issued_code) = state.auth_codes.read().await.get(code.as_str()).cloned() else {
         return Err(token_error("invalid_grant", "unknown or expired code"));
     };
 
@@ -1135,23 +1648,16 @@ async fn handle_auth_code_grant(
         return Err(token_error("invalid_client", "client_id mismatch"));
     }
 
-    // Enforce client authentication (client_secret_post).
-    let Some(ref provided_secret) = req.client_secret else {
-        return Err(token_error("invalid_client", "missing client_secret"));
-    };
     let clients = state.clients.read().await;
     let Some(registered) = clients.get(&issued_code.client_id) else {
         return Err(token_error("invalid_client", "unknown client_id"));
     };
-    // Use constant-time comparison to avoid timing side-channel leaks.
-    if provided_secret
-        .as_bytes()
-        .ct_ne(registered.client_secret.as_bytes())
-        .into()
-    {
-        return Err(token_error("invalid_client", "invalid client_secret"));
-    }
+    validate_client_auth(registered, req.client_secret.as_deref())?;
     drop(clients);
+
+    if req.resource.as_deref() != Some(issued_code.resource.as_str()) {
+        return Err(token_error("invalid_target", "resource mismatch"));
+    }
 
     // Validate redirect_uri.
     if req.redirect_uri.as_deref() != Some(&issued_code.redirect_uri) {
@@ -1169,6 +1675,16 @@ async fn handle_auth_code_grant(
         if computed_challenge != *original_challenge {
             return Err(token_error("invalid_grant", "PKCE verification failed"));
         }
+    }
+
+    if state
+        .auth_codes
+        .write()
+        .await
+        .remove(code.as_str())
+        .is_none()
+    {
+        return Err(token_error("invalid_grant", "unknown or expired code"));
     }
 
     // Issue the MCP access token.
@@ -1190,6 +1706,7 @@ async fn handle_auth_code_grant(
             IssuedToken {
                 user_id: issued_code.user_id.clone(),
                 client_id: issued_code.client_id.clone(),
+                resource: issued_code.resource.clone(),
                 issued_at: now,
                 expires_at,
             },
@@ -1202,11 +1719,16 @@ async fn handle_auth_code_grant(
             IssuedToken {
                 user_id: issued_code.user_id,
                 client_id: issued_code.client_id,
+                resource: issued_code.resource,
                 issued_at: now,
                 expires_at: now + chrono::Duration::days(30), // refresh tokens live longer
             },
         );
     }
+    state.persist().await.map_err(|error| {
+        eprintln!("[oauth] token: failed to persist issued token: {error}");
+        token_error("server_error", "failed to persist issued token")
+    })?;
 
     Ok(Json(TokenResponseBody {
         access_token,
@@ -1224,33 +1746,23 @@ async fn handle_refresh_token_grant(
         return Err(token_error("invalid_request", "missing refresh_token"));
     };
 
-    // Enforce client authentication (client_secret_post).
     let Some(ref client_id) = req.client_id else {
         return Err(token_error("invalid_client", "missing client_id"));
-    };
-    let Some(ref provided_secret) = req.client_secret else {
-        return Err(token_error("invalid_client", "missing client_secret"));
     };
     let clients = state.clients.read().await;
     let Some(registered) = clients.get(client_id.as_str()) else {
         return Err(token_error("invalid_client", "unknown client_id"));
     };
-    // Use constant-time comparison to avoid timing side-channel leaks.
-    if provided_secret
-        .as_bytes()
-        .ct_ne(registered.client_secret.as_bytes())
-        .into()
-    {
-        return Err(token_error("invalid_client", "invalid client_secret"));
-    }
+    validate_client_auth(registered, req.client_secret.as_deref())?;
     drop(clients);
 
-    // Consume the old refresh token from the dedicated refresh token map.
+    // Validate before consuming so malformed requests cannot revoke a valid token.
     let Some(old_token) = state
         .refresh_tokens
-        .write()
+        .read()
         .await
-        .remove(refresh_token.as_str())
+        .get(refresh_token.as_str())
+        .cloned()
     else {
         return Err(token_error(
             "invalid_grant",
@@ -1267,6 +1779,23 @@ async fn handle_refresh_token_grant(
         return Err(token_error(
             "invalid_grant",
             "refresh_token not bound to this client",
+        ));
+    }
+    if req.resource.as_deref() != Some(old_token.resource.as_str()) {
+        return Err(token_error("invalid_target", "resource mismatch"));
+    }
+
+    // Consume exactly once after every binding check has succeeded.
+    if state
+        .refresh_tokens
+        .write()
+        .await
+        .remove(refresh_token.as_str())
+        .is_none()
+    {
+        return Err(token_error(
+            "invalid_grant",
+            "unknown or expired refresh_token",
         ));
     }
 
@@ -1289,6 +1818,7 @@ async fn handle_refresh_token_grant(
             IssuedToken {
                 user_id: old_token.user_id.clone(),
                 client_id: client_id.clone(),
+                resource: old_token.resource.clone(),
                 issued_at: now,
                 expires_at,
             },
@@ -1301,11 +1831,16 @@ async fn handle_refresh_token_grant(
             IssuedToken {
                 user_id: old_token.user_id,
                 client_id: client_id.clone(),
+                resource: old_token.resource,
                 issued_at: now,
                 expires_at: now + chrono::Duration::days(30),
             },
         );
     }
+    state.persist().await.map_err(|error| {
+        eprintln!("[oauth] token: failed to persist refreshed token: {error}");
+        token_error("server_error", "failed to persist refreshed token")
+    })?;
 
     Ok(Json(TokenResponseBody {
         access_token: new_access,
@@ -1330,12 +1865,21 @@ fn token_error(error: &str, description: &str) -> (http::StatusCode, Json<serde_
 // ============================================================================
 
 /// Build a 401 response with the required `WWW-Authenticate` header (RFC 6750).
-fn unauthorized_response(error: &str, description: &str) -> axum::response::Response {
+fn unauthorized_response(
+    state: &OAuthServerState,
+    error: &str,
+    description: &str,
+) -> axum::response::Response {
+    let resource_metadata =
+        state.url_with_path(&[".well-known", "oauth-protected-resource", "mcp"]);
     (
         http::StatusCode::UNAUTHORIZED,
         [(
             http::header::WWW_AUTHENTICATE,
-            format!("Bearer error=\"{error}\", error_description=\"{description}\""),
+            format!(
+                "Bearer resource_metadata=\"{resource_metadata}\", \
+                 error=\"{error}\", error_description=\"{description}\""
+            ),
         )],
         description.to_string(),
     )
@@ -1353,7 +1897,7 @@ pub(crate) async fn auth_middleware(
     next: middleware::Next,
 ) -> Result<axum::response::Response, axum::response::Response> {
     let method = request.method().clone();
-    let uri = request.uri().clone();
+    let path = request.uri().path().to_string();
 
     let auth_header = request
         .headers()
@@ -1362,8 +1906,9 @@ pub(crate) async fn auth_middleware(
         .map(String::from);
 
     let Some(auth_value) = auth_header else {
-        eprintln!("[oauth] auth: {method} {uri} — missing Authorization header");
+        eprintln!("[oauth] auth: {method} {path} — missing Authorization header");
         return Err(unauthorized_response(
+            &state,
             "invalid_request",
             "Missing Authorization header",
         ));
@@ -1373,27 +1918,59 @@ pub(crate) async fn auth_middleware(
     let token = if auth_value.len() > 7 && auth_value[..7].eq_ignore_ascii_case("bearer ") {
         &auth_value[7..]
     } else {
-        eprintln!("[oauth] auth: {method} {uri} — invalid Authorization header format");
+        eprintln!("[oauth] auth: {method} {path} — invalid Authorization header format");
         return Err(unauthorized_response(
+            &state,
             "invalid_request",
             "Invalid Authorization header format",
         ));
     };
 
     let Some(user_ctx) = state.validate_token(token).await else {
-        eprintln!("[oauth] auth: {method} {uri} — invalid or expired token");
+        eprintln!("[oauth] auth: {method} {path} — invalid or expired token");
         return Err(unauthorized_response(
+            &state,
             "invalid_token",
             "Invalid or expired token",
         ));
     };
 
     eprintln!(
-        "[oauth] auth: {method} {uri} — authenticated user {}",
+        "[oauth] auth: {method} {path} — authenticated user {}",
         user_ctx.user_id
     );
     request.extensions_mut().insert(user_ctx);
     Ok(next.run(request).await)
+}
+
+/// Add browser and intermediary hardening headers to every HTTP response.
+pub(crate) async fn security_headers(
+    request: http::Request<axum::body::Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CACHE_CONTROL,
+        http::HeaderValue::from_static("no-store"),
+    );
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        http::header::X_FRAME_OPTIONS,
+        http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        http::header::REFERRER_POLICY,
+        http::HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        http::header::CONTENT_SECURITY_POLICY,
+        http::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    response
 }
 
 // ============================================================================
@@ -1404,6 +1981,7 @@ pub(crate) async fn auth_middleware(
 ///
 /// The returned router includes:
 /// - `GET /health` — Health check (returns 200 OK)
+/// - `GET /ready` — Readiness check
 /// - `GET /.well-known/oauth-protected-resource/mcp` — RFC 9728 (path-suffixed)
 /// - `GET /.well-known/oauth-protected-resource` — RFC 9728 (fallback without suffix)
 /// - `GET /.well-known/oauth-authorization-server` — RFC 8414
@@ -1425,8 +2003,8 @@ pub(crate) fn oauth_router(state: Arc<OAuthServerState>) -> Router {
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_methods([http::Method::GET, http::Method::POST, http::Method::OPTIONS])
+        .allow_headers([http::header::ACCEPT, http::header::CONTENT_TYPE]);
 
     // Endpoints that browser-based MCP clients fetch cross-origin
     // (metadata discovery, dynamic client registration, token exchange).
@@ -1453,6 +2031,7 @@ pub(crate) fn oauth_router(state: Arc<OAuthServerState>) -> Router {
     // health checks — these do not need CORS headers.
     let non_cors_routes = Router::new()
         .route("/health", routing::get(health))
+        .route("/ready", routing::get(ready))
         .route("/oauth/authorize", routing::get(authorize))
         .route("/oauth/callback", routing::get(onshape_callback));
 
@@ -1476,7 +2055,21 @@ mod tests {
             url::Url::parse(public_url).expect("valid test URL"),
             "onshape-client-id".to_string(),
             SecretString::from("onshape-client-secret"),
-            vec!["allowed-user-1".to_string()],
+            None,
+            vec![
+                AllowedUser {
+                    id: "allowed-user-1".to_string(),
+                    name: Some("Allowed User".to_string()),
+                    access: AccessLevel::Full,
+                },
+                AllowedUser {
+                    id: "allowed-user-2".to_string(),
+                    name: Some("Second Allowed User".to_string()),
+                    access: AccessLevel::Read,
+                },
+            ],
+            100,
+            100,
         )
     }
 
@@ -1488,8 +2081,9 @@ mod tests {
             client_id.clone(),
             RegisteredClient {
                 client_id: client_id.clone(),
-                client_secret: client_secret.clone(),
+                client_secret: Some(client_secret.clone()),
                 redirect_uris: vec!["https://example.com/callback".to_string()],
+                token_endpoint_auth_method: "client_secret_post".to_string(),
             },
         );
         (client_id, client_secret)
@@ -1508,6 +2102,7 @@ mod tests {
             IssuedToken {
                 user_id: user_id.to_string(),
                 client_id: client_id.to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 issued_at: now,
                 expires_at: now + chrono::Duration::seconds(TOKEN_LIFETIME_SECS),
             },
@@ -1522,7 +2117,8 @@ mod tests {
                     Some(now + chrono::Duration::hours(1)),
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
         token
     }
 
@@ -1561,7 +2157,8 @@ mod tests {
                     Some(chrono::Utc::now() + chrono::Duration::hours(1)),
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
 
         let replacement = state.validation_for_user("allowed-user-1").await;
         assert!(!Arc::ptr_eq(&validation, &replacement));
@@ -1587,7 +2184,8 @@ mod tests {
                     Some(chrono::Utc::now() + chrono::Duration::hours(1)),
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
 
         *active_validation.lock().await = ValidationState {
             status: ValidationStatus::Valid,
@@ -1615,7 +2213,8 @@ mod tests {
                     None,
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
 
         let refresh_lock = state.get_user_refresh_lock("allowed-user-1").await;
         let refresh_guard = refresh_lock.lock().await;
@@ -1630,7 +2229,8 @@ mod tests {
                         None,
                     ),
                 )
-                .await;
+                .await
+                .expect("in-memory persistence cannot fail");
         });
 
         tokio::task::yield_now().await;
@@ -1644,7 +2244,8 @@ mod tests {
                     None,
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
         drop(refresh_guard);
         reauthorization
             .await
@@ -1681,7 +2282,8 @@ mod tests {
                     None,
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
         let current_context = state
             .validate_token(&token)
             .await
@@ -1713,6 +2315,7 @@ mod tests {
             IssuedToken {
                 user_id: "allowed-user-1".to_string(),
                 client_id: "some-client".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 issued_at: now - chrono::Duration::hours(2),
                 expires_at: now - chrono::Duration::hours(1), // expired
             },
@@ -1741,6 +2344,7 @@ mod tests {
             IssuedToken {
                 user_id: "allowed-user-1".to_string(),
                 client_id: "some-client".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 issued_at: now,
                 expires_at: now + chrono::Duration::days(30),
             },
@@ -1949,7 +2553,7 @@ mod tests {
             redirect_uris: vec!["https://example.com/cb".to_string()],
             grant_types: vec!["authorization_code".to_string()],
             response_types: vec!["code".to_string()],
-            token_endpoint_auth_method: None,
+            token_endpoint_auth_method: Some("client_secret_post".to_string()),
         };
 
         let result = register_client(State(state.clone()), Json(req)).await;
@@ -1957,8 +2561,147 @@ mod tests {
 
         let response = result.expect("should be Ok");
         assert!(!response.client_id.is_empty());
-        assert!(!response.client_secret.is_empty());
+        assert!(response.client_secret.is_some());
         assert_eq!(response.token_endpoint_auth_method, "client_secret_post");
+    }
+
+    #[tokio::test]
+    async fn dcr_accepts_public_client_without_secret() {
+        let state = Arc::new(test_state());
+        let req = RegisterRequest {
+            client_name: Some("Public MCP Client".to_string()),
+            redirect_uris: vec!["https://example.com/cb".to_string()],
+            grant_types: vec!["authorization_code".to_string()],
+            response_types: vec!["code".to_string()],
+            token_endpoint_auth_method: Some("none".to_string()),
+        };
+
+        let response = register_client(State(state), Json(req))
+            .await
+            .expect("public client registration should succeed");
+        assert!(response.client_secret.is_none());
+        assert_eq!(response.token_endpoint_auth_method, "none");
+    }
+
+    #[tokio::test]
+    async fn public_client_can_exchange_code_with_pkce_and_no_secret() {
+        use base64::Engine as _;
+
+        let state = test_state();
+        let client_id = "public-client".to_string();
+        state.clients.write().await.insert(
+            client_id.clone(),
+            RegisteredClient {
+                client_id: client_id.clone(),
+                client_secret: None,
+                redirect_uris: vec!["https://example.com/callback".to_string()],
+                token_endpoint_auth_method: "none".to_string(),
+            },
+        );
+        state
+            .store_refreshed_user_tokens(
+                "allowed-user-1",
+                UserOnshapeTokens::new(
+                    SecretString::from("onshape-at"),
+                    SecretString::from("onshape-rt"),
+                    None,
+                ),
+            )
+            .await
+            .expect("in-memory persistence cannot fail");
+        let verifier = "public-client-pkce-verifier";
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(verifier.as_bytes()));
+        let code = random_hex(32);
+        state.auth_codes.write().await.insert(
+            code.clone(),
+            IssuedAuthCode {
+                client_id: client_id.clone(),
+                redirect_uri: "https://example.com/callback".to_string(),
+                pkce_code_challenge: Some(challenge),
+                user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let request = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some(code),
+            redirect_uri: Some("https://example.com/callback".to_string()),
+            client_id: Some(client_id),
+            client_secret: None,
+            code_verifier: Some(verifier.to_string()),
+            refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
+        };
+
+        assert!(handle_auth_code_grant(&state, &request).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn auth_code_grant_rejects_wrong_resource_without_consuming_code() {
+        let state = test_state();
+        let (client_id, client_secret) = register_test_client(&state).await;
+        let code = random_hex(32);
+        state.auth_codes.write().await.insert(
+            code.clone(),
+            IssuedAuthCode {
+                client_id: client_id.clone(),
+                redirect_uri: "https://example.com/callback".to_string(),
+                pkce_code_challenge: None,
+                user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
+                created_at: chrono::Utc::now(),
+            },
+        );
+        let request = TokenRequest {
+            grant_type: "authorization_code".to_string(),
+            code: Some(code.clone()),
+            redirect_uri: Some("https://example.com/callback".to_string()),
+            client_id: Some(client_id),
+            client_secret: Some(client_secret),
+            code_verifier: None,
+            refresh_token: None,
+            resource: Some("https://other.example/mcp".to_string()),
+        };
+
+        let result = handle_auth_code_grant(&state, &request).await;
+        assert!(result.is_err());
+        assert!(state.auth_codes.read().await.contains_key(&code));
+    }
+
+    #[tokio::test]
+    async fn encrypted_state_survives_restart_without_plaintext_tokens() {
+        use base64::Engine as _;
+
+        let directory = tempfile::TempDir::new().expect("temporary directory");
+        let path = directory.path().join("oauth-state.enc");
+        let key = base64::engine::general_purpose::STANDARD.encode([7_u8; 32]);
+        let state = test_state()
+            .with_encrypted_persistence(path.clone(), &key)
+            .expect("persistence should initialize");
+        let (client_id, _) = register_test_client(&state).await;
+        let access_token = insert_access_token(&state, "allowed-user-1", &client_id).await;
+        state.persist().await.expect("state should persist");
+
+        let encrypted = std::fs::read(&path).expect("state file should exist");
+        assert!(
+            !encrypted
+                .windows(access_token.len())
+                .any(|bytes| bytes == access_token.as_bytes())
+        );
+        let onshape_token = b"onshape-access-token";
+        assert!(
+            !encrypted
+                .windows(onshape_token.len())
+                .any(|bytes| bytes == onshape_token)
+        );
+
+        let reloaded = test_state()
+            .with_encrypted_persistence(path, &key)
+            .expect("persisted state should load");
+        assert!(reloaded.clients.read().await.contains_key(&client_id));
+        assert!(reloaded.validate_token(&access_token).await.is_some());
     }
 
     // ================================================================
@@ -1985,6 +2728,7 @@ mod tests {
                 redirect_uri: "https://example.com/callback".to_string(),
                 pkce_code_challenge: Some(challenge),
                 user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 created_at: chrono::Utc::now(),
             },
         );
@@ -1997,6 +2741,7 @@ mod tests {
             client_secret: None, // missing!
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_auth_code_grant(&state, &req).await;
@@ -2025,6 +2770,7 @@ mod tests {
                 redirect_uri: "https://example.com/callback".to_string(),
                 pkce_code_challenge: Some(challenge),
                 user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 created_at: chrono::Utc::now(),
             },
         );
@@ -2037,6 +2783,7 @@ mod tests {
             client_secret: Some("wrong-secret".to_string()),
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_auth_code_grant(&state, &req).await;
@@ -2063,6 +2810,7 @@ mod tests {
                 redirect_uri: "https://example.com/callback".to_string(),
                 pkce_code_challenge: Some(challenge),
                 user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 created_at: chrono::Utc::now(),
             },
         );
@@ -2077,7 +2825,8 @@ mod tests {
                     None,
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
 
         // Correct verifier should succeed.
         let req = TokenRequest {
@@ -2088,6 +2837,7 @@ mod tests {
             client_secret: Some(client_secret.clone()),
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_auth_code_grant(&state, &req).await;
@@ -2116,6 +2866,7 @@ mod tests {
                 redirect_uri: "https://example.com/callback".to_string(),
                 pkce_code_challenge: Some(challenge),
                 user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 created_at: chrono::Utc::now(),
             },
         );
@@ -2128,6 +2879,7 @@ mod tests {
             client_secret: Some(client_secret),
             code_verifier: Some("wrong-verifier".to_string()),
             refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_auth_code_grant(&state, &req).await;
@@ -2153,6 +2905,7 @@ mod tests {
                 redirect_uri: "https://example.com/callback".to_string(),
                 pkce_code_challenge: Some(challenge),
                 user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 created_at: chrono::Utc::now() - chrono::Duration::seconds(AUTH_CODE_TTL_SECS + 1),
             },
         );
@@ -2165,6 +2918,7 @@ mod tests {
             client_secret: Some(client_secret),
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_auth_code_grant(&state, &req).await;
@@ -2190,6 +2944,7 @@ mod tests {
             state: Some("test-state".to_string()),
             code_challenge: None, // missing — must be rejected
             code_challenge_method: None,
+            resource: Some(state.url_with_path(&["mcp"])),
             scope: None,
         };
 
@@ -2201,6 +2956,37 @@ mod tests {
             body.contains("code_challenge is required"),
             "unexpected error message: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn authorize_includes_configured_enterprise_company_id() {
+        let mut state = test_state();
+        state.onshape_company_id = Some("company-123".to_string());
+        let state = Arc::new(state);
+        let (client_id, _) = register_test_client(&state).await;
+
+        let params = AuthorizeParams {
+            response_type: "code".to_string(),
+            client_id,
+            redirect_uri: "https://example.com/callback".to_string(),
+            state: Some("test-state".to_string()),
+            code_challenge: Some("test-challenge".to_string()),
+            code_challenge_method: Some("S256".to_string()),
+            resource: Some(state.url_with_path(&["mcp"])),
+            scope: None,
+        };
+
+        let response = authorize(State(state), Query(params))
+            .await
+            .expect("authorization should redirect")
+            .into_response();
+        let location = response
+            .headers()
+            .get(http::header::LOCATION)
+            .expect("redirect should include Location")
+            .to_str()
+            .expect("Location should be UTF-8");
+        assert!(location.contains("company_id=company-123"));
     }
 
     // ================================================================
@@ -2218,6 +3004,7 @@ mod tests {
             client_secret: None,
             code_verifier: None,
             refresh_token: Some("some-refresh-token".to_string()),
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_refresh_token_grant(&state, &req).await;
@@ -2238,6 +3025,7 @@ mod tests {
             IssuedToken {
                 user_id: "allowed-user-1".to_string(),
                 client_id: client_a_id.clone(),
+                resource: state.url_with_path(&["mcp"]),
                 issued_at: now,
                 expires_at: now + chrono::Duration::days(30),
             },
@@ -2248,7 +3036,8 @@ mod tests {
                 "allowed-user-1",
                 UserOnshapeTokens::new(SecretString::from("at"), SecretString::from("rt"), None),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
 
         // Client B should NOT be able to use client A's refresh token.
         let req = TokenRequest {
@@ -2259,6 +3048,7 @@ mod tests {
             client_secret: Some(client_b_secret),
             code_verifier: None,
             refresh_token: Some(refresh_token),
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_refresh_token_grant(&state, &req).await;
@@ -2280,6 +3070,7 @@ mod tests {
             IssuedToken {
                 user_id: "allowed-user-1".to_string(),
                 client_id: client_id.clone(),
+                resource: state.url_with_path(&["mcp"]),
                 issued_at: now,
                 expires_at: now + chrono::Duration::days(30),
             },
@@ -2289,7 +3080,8 @@ mod tests {
                 "allowed-user-1",
                 UserOnshapeTokens::new(SecretString::from("at"), SecretString::from("rt"), None),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
 
         let req = TokenRequest {
             grant_type: "refresh_token".to_string(),
@@ -2299,6 +3091,7 @@ mod tests {
             client_secret: Some(client_secret),
             code_verifier: None,
             refresh_token: Some(refresh_token.clone()),
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_refresh_token_grant(&state, &req).await;
@@ -2334,6 +3127,7 @@ mod tests {
             IssuedToken {
                 user_id: "allowed-user-1".to_string(),
                 client_id: client_id.clone(),
+                resource: state.url_with_path(&["mcp"]),
                 issued_at: now,
                 expires_at: now + chrono::Duration::days(30),
             },
@@ -2349,6 +3143,7 @@ mod tests {
             client_secret: Some(client_secret),
             code_verifier: None,
             refresh_token: Some(refresh_token),
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result = handle_refresh_token_grant(&state, &req).await;
@@ -2375,6 +3170,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn auth_code_grant_revokes_old_tokens_for_same_client() {
         let state = test_state();
         let (client_id, client_secret) = register_test_client(&state).await;
@@ -2389,7 +3185,8 @@ mod tests {
                     None,
                 ),
             )
-            .await;
+            .await
+            .expect("in-memory persistence cannot fail");
 
         // First auth code grant — issues initial tokens.
         let code1 = random_hex(32);
@@ -2400,6 +3197,7 @@ mod tests {
                 redirect_uri: "https://example.com/callback".to_string(),
                 pkce_code_challenge: None,
                 user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 created_at: chrono::Utc::now(),
             },
         );
@@ -2412,6 +3210,7 @@ mod tests {
             client_secret: Some(client_secret.clone()),
             code_verifier: None,
             refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result1 = handle_auth_code_grant(&state, &req1).await;
@@ -2442,6 +3241,7 @@ mod tests {
                 redirect_uri: "https://example.com/callback".to_string(),
                 pkce_code_challenge: None,
                 user_id: "allowed-user-1".to_string(),
+                resource: state.url_with_path(&["mcp"]),
                 created_at: chrono::Utc::now(),
             },
         );
@@ -2454,6 +3254,7 @@ mod tests {
             client_secret: Some(client_secret),
             code_verifier: None,
             refresh_token: None,
+            resource: Some(state.url_with_path(&["mcp"])),
         };
 
         let result2 = handle_auth_code_grant(&state, &req2).await;

@@ -62,27 +62,37 @@ timeout = "30s"
 `auth.proxy_url` has no default. Set it only when explicitly using a proxy you
 self-host, for example `proxy_url = "https://oauth-proxy.example.com"`.
 
-Experimental self-hosted Streamable HTTP configuration:
+Self-hosted Streamable HTTP configuration:
 
 ```toml
 [http]
+production = true
 host = "127.0.0.1"
 port = 8080
 public_url = "https://mcp.example.com"
 onshape_client_id = "operator-owned-client-id"
 onshape_client_secret = "operator-owned-client-secret"
+onshape_company_id = "enterprise-company-id"
+state_file = "/var/lib/onshape-mcp/oauth-state.enc"
+state_encryption_key = "base64-encoded-32-byte-key"
+max_request_body_bytes = 16777216
+max_registered_clients = 1000
+max_pending_authorizations = 256
 
 [[http.allowed_users]]
 id = "onshape-user-id"
 name = "Optional display name"
+access = "read"
 ```
 
 `public_url` is the origin without `/mcp`, a query, or fragment. Clients use
 `https://mcp.example.com/mcp`. Production deployments commonly bind
 `0.0.0.0` behind TLS termination. An empty `allowed_users` list denies all
-users. These settings are implemented but experimental; no public deployment
-is provided, and ChatGPT failure is tracked in
-[#546](https://github.com/altendky/onshape-mcp/issues/546).
+users. Production mode also requires a non-empty allowlist, an absolute state
+file path, and an encryption key. Prefer the `_FILE` environment variables
+documented by the [enterprise deployment](../../../deploy/enterprise/README.md)
+for secrets instead of placing them directly in configuration. No public
+deployment is provided.
 
 The Streamable HTTP transport validates the request `Host` against the exact
 authority configured by `public_url` to prevent DNS rebinding.
@@ -111,12 +121,20 @@ All environment variables use the `ONSHAPE_MCP_` prefix.
 | Auth Method | `string` | `auto` | `ONSHAPE_MCP_AUTH__METHOD` | `auth.method` | `--auth-method` | Authentication method (`auto`, `basic`, `oauth`; HMAC planned) |
 | Auth Check Interval | `duration` | `5m` | `ONSHAPE_MCP_AUTH__CHECK_INTERVAL` | `auth.check_interval` | — | Periodic credential validation interval (minimum: 15s) |
 | API Timeout | `duration` | `30s` | `ONSHAPE_MCP_API__TIMEOUT` | `api.timeout` | — | Request timeout for Onshape API calls |
-| HTTP Host | `string` | `127.0.0.1` | `ONSHAPE_MCP_HTTP__HOST` | `http.host` | `http --host` | Experimental Streamable HTTP listen address |
-| HTTP Port | `u16` | `8080` | `ONSHAPE_MCP_HTTP__PORT` | `http.port` | `http --port` | Experimental Streamable HTTP listen port |
+| HTTP Host | `string` | `127.0.0.1` | `ONSHAPE_MCP_HTTP__HOST` | `http.host` | `http --host` | Streamable HTTP listen address |
+| HTTP Port | `u16` | `8080` | `ONSHAPE_MCP_HTTP__PORT` | `http.port` | `http --port` | Streamable HTTP listen port |
 | HTTP Public URL | `URL` | — | `ONSHAPE_MCP_HTTP__PUBLIC_URL` | `http.public_url` | `http --public-url` | Required origin used for OAuth metadata and callback URLs |
 | HTTP Onshape Client ID | `string` | — | `ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_ID` | `http.onshape_client_id` | `http --onshape-client-id` | Required operator-owned OAuth client ID |
 | HTTP Onshape Client Secret | `string` | — | `ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET` | `http.onshape_client_secret` | `http --onshape-client-secret` | Required operator-owned OAuth client secret |
-| HTTP Allowed Users | user list | empty (deny all) | `ONSHAPE_MCP_HTTP__ALLOWED_USERS` | `http.allowed_users` | `http --allowed-users` | Onshape user IDs; env/CLI accepts `id:name,id2:name2` |
+| HTTP Onshape Company ID | `string` | — | `ONSHAPE_MCP_HTTP__ONSHAPE_COMPANY_ID` | `http.onshape_company_id` | — | Optional enterprise company binding for Onshape authorization |
+| HTTP Allowed Users | user list | empty (deny all) | `ONSHAPE_MCP_HTTP__ALLOWED_USERS` | `http.allowed_users` | `http --allowed-users` | Onshape IDs and access; env/CLI accepts `id:name:read,id2:name:write` |
+| HTTP Production Checks | `bool` | `false` | `ONSHAPE_MCP_HTTP__PRODUCTION` | `http.production` | — | Require HTTPS, users, encrypted durable state, and absolute state path |
+| HTTP State File | path | — | `ONSHAPE_MCP_HTTP__STATE_FILE` | `http.state_file` | — | Encrypted OAuth client, grant, token, and per-user Onshape state |
+| HTTP State Key | base64 | — | `ONSHAPE_MCP_HTTP__STATE_ENCRYPTION_KEY` or `ONSHAPE_MCP_HTTP__STATE_ENCRYPTION_KEY_FILE` | `http.state_encryption_key` | — | Base64-encoded 32-byte AES-GCM key |
+| HTTP Onshape Secret File | path | — | `ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET_FILE` | — | — | Absolute path to operator OAuth client secret; overrides direct value |
+| HTTP Request Limit | bytes | `16777216` | `ONSHAPE_MCP_HTTP__MAX_REQUEST_BODY_BYTES` | `http.max_request_body_bytes` | — | Maximum inbound request body |
+| HTTP Registered Clients | count | `1000` | `ONSHAPE_MCP_HTTP__MAX_REGISTERED_CLIENTS` | `http.max_registered_clients` | — | Maximum dynamically registered MCP clients |
+| HTTP Pending Grants | count | `256` | `ONSHAPE_MCP_HTTP__MAX_PENDING_AUTHORIZATIONS` | `http.max_pending_authorizations` | — | Maximum simultaneous browser authorization flows |
 | Max Mode | `read`/`modify`/`destroy` | `read` | `ONSHAPE_MCP_MAX_MODE` | `mode.max` | — | *Planned, not yet implemented.* Upper limit for permission mode |
 | Initial Mode | `read`/`modify`/`destroy` | `read` | `ONSHAPE_MCP_INITIAL_MODE` | `mode.initial` | — | *Planned, not yet implemented.* Starting permission mode (must be ≤ max_mode) |
 | Allow Mode Escalation | `bool` | `false` | `ONSHAPE_MCP_ALLOW_ESCALATION` | `mode.allow_escalation` | — | *Planned, not yet implemented.* Can AI change mode at runtime? |

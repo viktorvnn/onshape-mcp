@@ -1,5 +1,5 @@
 # Stage 1: Build the binary
-FROM rust:1.94-slim AS builder
+FROM rust:1.94-slim@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a AS builder
 
 WORKDIR /build
 
@@ -46,9 +46,9 @@ RUN touch crates/*/src/*.rs crates/*/src/**/*.rs 2>/dev/null; \
     cargo build --release --package onshape-mcp
 
 # Stage 2: Minimal runtime image
-# Must match the builder's Debian version (rust:1.89-slim is based on trixie)
+# Must match the builder's Debian version (rust:1.94-slim is based on trixie)
 # to avoid glibc version mismatches.
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
 # Install CA certificates (HTTPS) and curl (HEALTHCHECK)
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -57,7 +57,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for container security
-RUN useradd --create-home --shell /bin/bash appuser
+RUN useradd --uid 10001 --create-home --shell /bin/bash appuser \
+    && install -d -o appuser -g appuser -m 0700 /var/lib/onshape-mcp
 
 COPY --from=builder /build/target/release/onshape-mcp /usr/local/bin/onshape-mcp
 

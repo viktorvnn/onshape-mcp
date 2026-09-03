@@ -3,6 +3,7 @@
 //! Pure data types and validation for application configuration.
 //! No I/O — config loading is handled by `onshape-mcp-io`.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -94,12 +95,24 @@ pub const DEFAULT_TRANSPORT_HOST: &str = "127.0.0.1";
 /// Default port for the HTTP transport server.
 pub const DEFAULT_TRANSPORT_PORT: u16 = 8080;
 
+/// Default maximum size of one inbound MCP HTTP request (16 MiB).
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default cap for dynamically registered MCP clients.
+pub const DEFAULT_MAX_REGISTERED_CLIENTS: usize = 1_000;
+
+/// Default cap for simultaneous browser authorization flows.
+pub const DEFAULT_MAX_PENDING_AUTHORIZATIONS: usize = 256;
+
 /// HTTP transport configuration.
 ///
 /// Used by the `onshape-mcp http` subcommand to serve the MCP server
 /// over Streamable HTTP with per-user OAuth authentication.
 #[derive(Deserialize)]
 pub struct HttpTransportConfig {
+    /// Enable production safety checks for company-hosted deployments.
+    #[serde(default)]
+    pub production: bool,
     /// Listen address (default: `127.0.0.1`).
     #[serde(default = "default_transport_host")]
     pub host: String,
@@ -118,6 +131,24 @@ pub struct HttpTransportConfig {
     /// Onshape OAuth application client secret.
     #[serde(default)]
     pub onshape_client_secret: Option<SecretString>,
+    /// Optional Onshape enterprise company ID passed during authorization.
+    #[serde(default)]
+    pub onshape_company_id: Option<String>,
+    /// Encrypted OAuth state file used to survive restarts.
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
+    /// Base64-encoded 256-bit AES key used to encrypt `state_file`.
+    #[serde(default)]
+    pub state_encryption_key: Option<SecretString>,
+    /// Maximum inbound MCP request body size.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    /// Maximum number of dynamically registered MCP clients.
+    #[serde(default = "default_max_registered_clients")]
+    pub max_registered_clients: usize,
+    /// Maximum number of simultaneous pending authorization flows.
+    #[serde(default = "default_max_pending_authorizations")]
+    pub max_pending_authorizations: usize,
     /// Allowlist of Onshape user IDs permitted to connect.
     ///
     /// Empty list = fail-closed (nobody allowed).
@@ -133,14 +164,33 @@ pub struct HttpTransportConfig {
 impl Default for HttpTransportConfig {
     fn default() -> Self {
         Self {
+            production: false,
             host: DEFAULT_TRANSPORT_HOST.to_string(),
             port: DEFAULT_TRANSPORT_PORT,
             public_url: None,
             onshape_client_id: None,
             onshape_client_secret: None,
+            onshape_company_id: None,
+            state_file: None,
+            state_encryption_key: None,
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_registered_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
+            max_pending_authorizations: DEFAULT_MAX_PENDING_AUTHORIZATIONS,
             allowed_users: Vec::new(),
         }
     }
+}
+
+const fn default_max_request_body_bytes() -> usize {
+    DEFAULT_MAX_REQUEST_BODY_BYTES
+}
+
+const fn default_max_registered_clients() -> usize {
+    DEFAULT_MAX_REGISTERED_CLIENTS
+}
+
+const fn default_max_pending_authorizations() -> usize {
+    DEFAULT_MAX_PENDING_AUTHORIZATIONS
 }
 
 /// An entry in the HTTP transport allowlist.
@@ -151,6 +201,57 @@ pub struct AllowedUser {
     /// Human-readable name (ignored at runtime, for config readability).
     #[serde(default)]
     pub name: Option<String>,
+    /// Maximum Onshape API access granted through the MCP server.
+    ///
+    /// Defaults to read-only. Write access must be granted explicitly for
+    /// company-hosted deployments; delete operations require `full` access.
+    #[serde(default)]
+    pub access: AccessLevel,
+}
+
+/// Maximum Onshape API access granted to an HTTP transport user.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AccessLevel {
+    /// Allow safe HTTP methods only (`GET`, `HEAD`, and `OPTIONS`).
+    #[default]
+    Read,
+    /// Additionally allow non-destructive write methods (`POST`, `PUT`, and `PATCH`).
+    Write,
+    /// Allow standard API methods including `DELETE`.
+    Full,
+}
+
+impl AccessLevel {
+    /// Return whether this access level permits an Onshape API method.
+    #[must_use]
+    pub const fn allows(self, method: &http::Method) -> bool {
+        match self {
+            Self::Read => matches!(
+                *method,
+                http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+            ),
+            Self::Write => matches!(
+                *method,
+                http::Method::GET
+                    | http::Method::HEAD
+                    | http::Method::OPTIONS
+                    | http::Method::POST
+                    | http::Method::PUT
+                    | http::Method::PATCH
+            ),
+            Self::Full => matches!(
+                *method,
+                http::Method::GET
+                    | http::Method::HEAD
+                    | http::Method::OPTIONS
+                    | http::Method::POST
+                    | http::Method::PUT
+                    | http::Method::PATCH
+                    | http::Method::DELETE
+            ),
+        }
+    }
 }
 
 /// Top-level application configuration.
@@ -549,8 +650,8 @@ fn parse_duration_str(s: &str) -> Result<Duration, String> {
 /// Deserializes `allowed_users` from either a TOML array of objects or a
 /// comma-separated string (useful for environment variables).
 ///
-/// String format: `id1:name1,id2:name2` or just `id1,id2`.
-/// The `:name` portion is optional and ignored at runtime.
+/// String format: `id1:name1:read,id2:name2:write` or just `id1,id2`.
+/// Name and access are optional; access defaults to `read`.
 fn deserialize_allowed_users<'de, D>(deserializer: D) -> Result<Vec<AllowedUser>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -564,8 +665,8 @@ where
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str(
-                "a list of allowed users (TOML array of {id, name} objects) \
-                 or a comma-separated string like \"id1:name1,id2:name2\"",
+                "a list of allowed users (TOML array of {id, name, access} objects) \
+                 or a comma-separated string like \"id1:name1:read,id2:name2:write\"",
             )
         }
 
@@ -588,11 +689,12 @@ where
     deserializer.deserialize_any(AllowedUsersVisitor)
 }
 
-/// Parse a comma-separated string of `id:name` pairs into `AllowedUser` entries.
+/// Parse comma-separated `id[:name[:access]]` entries into allowed users.
 ///
 /// - Empty or whitespace-only strings produce an empty vec.
 /// - Each entry is trimmed. Empty entries (from trailing commas) are skipped.
-/// - The `:name` portion is optional.
+/// - Name and access are optional; access defaults to read-only.
+/// - Use an empty name to set access without a display name: `id::write`.
 pub fn parse_allowed_users_csv(s: &str) -> Vec<AllowedUser> {
     if s.trim().is_empty() {
         return Vec::new();
@@ -601,22 +703,23 @@ pub fn parse_allowed_users_csv(s: &str) -> Vec<AllowedUser> {
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .filter_map(|entry| {
-            if let Some((id, name)) = entry.split_once(':') {
-                let id = id.trim();
-                if id.is_empty() {
-                    return None;
-                }
-                let name = name.trim();
-                Some(AllowedUser {
-                    id: id.to_string(),
-                    name: (!name.is_empty()).then(|| name.to_string()),
-                })
-            } else {
-                Some(AllowedUser {
-                    id: entry.to_string(),
-                    name: None,
-                })
+            let mut parts = entry.splitn(3, ':');
+            let id = parts.next().unwrap_or_default().trim();
+            if id.is_empty() {
+                return None;
             }
+            let name = parts.next().map(str::trim).filter(|name| !name.is_empty());
+            let access = match parts.next().map(str::trim) {
+                None | Some("" | "read") => AccessLevel::Read,
+                Some("write") => AccessLevel::Write,
+                Some("full") => AccessLevel::Full,
+                Some(_) => return None,
+            };
+            Some(AllowedUser {
+                id: id.to_string(),
+                name: name.map(ToString::to_string),
+                access,
+            })
         })
         .collect()
 }
@@ -1212,6 +1315,11 @@ mod tests {
         assert!(config.onshape_client_id.is_none());
         assert!(config.onshape_client_secret.is_none());
         assert!(config.allowed_users.is_empty());
+        assert!(!config.production);
+        assert_eq!(
+            config.max_request_body_bytes,
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
     }
 
     #[test]
@@ -1234,6 +1342,7 @@ mod tests {
             public_url = "https://mcp.example.com"
             onshape_client_id = "my-client-id"
             onshape_client_secret = "my-secret"
+            onshape_company_id = "company-123"
             allowed_users = "abc123:Alice,def456:Bob"
         "#;
         let config: HttpTransportConfig = toml::from_str(toml_str).expect("should deserialize");
@@ -1244,6 +1353,7 @@ mod tests {
             Some("https://mcp.example.com")
         );
         assert_eq!(config.onshape_client_id.as_deref(), Some("my-client-id"));
+        assert_eq!(config.onshape_company_id.as_deref(), Some("company-123"));
         assert_eq!(
             config
                 .onshape_client_secret
@@ -1281,6 +1391,7 @@ mod tests {
             [[allowed_users]]
             id = "user1"
             name = "User One"
+            access = "write"
 
             [[allowed_users]]
             id = "user2"
@@ -1289,8 +1400,21 @@ mod tests {
         assert_eq!(config.allowed_users.len(), 2);
         assert_eq!(config.allowed_users[0].id, "user1");
         assert_eq!(config.allowed_users[0].name.as_deref(), Some("User One"));
+        assert_eq!(config.allowed_users[0].access, AccessLevel::Write);
         assert_eq!(config.allowed_users[1].id, "user2");
         assert!(config.allowed_users[1].name.is_none());
+        assert_eq!(config.allowed_users[1].access, AccessLevel::Read);
+    }
+
+    #[test]
+    fn access_levels_enforce_http_method_boundaries() {
+        assert!(AccessLevel::Read.allows(&http::Method::GET));
+        assert!(!AccessLevel::Read.allows(&http::Method::POST));
+        assert!(AccessLevel::Write.allows(&http::Method::PATCH));
+        assert!(!AccessLevel::Write.allows(&http::Method::DELETE));
+        assert!(!AccessLevel::Write.allows(&http::Method::TRACE));
+        assert!(AccessLevel::Full.allows(&http::Method::DELETE));
+        assert!(!AccessLevel::Full.allows(&http::Method::CONNECT));
     }
 
     // ====================================================================
@@ -1468,6 +1592,24 @@ mod tests {
         assert_eq!(users[0].name.as_deref(), Some("alice"));
         assert_eq!(users[1].id, "def456");
         assert_eq!(users[1].name.as_deref(), Some("bob"));
+        assert_eq!(users[0].access, AccessLevel::Read);
+    }
+
+    #[test]
+    fn allowed_users_csv_with_access_levels() {
+        let users = parse_allowed_users_csv("abc:Alice:read,def:Bob:write,ghi::full");
+        assert_eq!(users.len(), 3);
+        assert_eq!(users[0].access, AccessLevel::Read);
+        assert_eq!(users[1].access, AccessLevel::Write);
+        assert_eq!(users[2].access, AccessLevel::Full);
+        assert!(users[2].name.is_none());
+    }
+
+    #[test]
+    fn allowed_users_csv_skips_invalid_access_level() {
+        let users = parse_allowed_users_csv("abc:Alice:owner,def:Bob:write");
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].id, "def");
     }
 
     #[test]

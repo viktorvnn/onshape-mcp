@@ -125,14 +125,19 @@ Prefer configuration or `ONSHAPE_MCP_AUTH__CLIENT_ID` and
 process listings. Restart or start your MCP client, then ask your AI assistant
 to create a new Onshape document with a simple shape.
 
-### Experimental Remote Setup
+### Company-hosted server
 
-Streamable HTTP remains available for self-hosting, but it is experimental and
-has not been broadly verified. This project offers no publicly operated
-endpoint. If an independent operator gives you access, add a placeholder URL such as
-`https://mcp.example.com/mcp` to your web MCP client and confirm the operator's
-trust, access, and retention policies first. ChatGPT connectivity is currently
-known to fail; see [#546](https://github.com/altendky/onshape-mcp/issues/546).
+For an engineering team, use the hardened single-server deployment in
+[`deploy/enterprise/`](deploy/enterprise/README.md). It provides TLS, per-user
+Onshape OAuth, a fail-closed user allowlist, read/write/full access levels,
+encrypted restart-persistent OAuth state, request bounds, security headers,
+health checks, and audit events. It deliberately runs one application replica;
+active-active deployment requires a transactional shared state backend.
+
+The MCP client URL is `https://<your-domain>/mcp`. This project does not provide
+a publicly operated endpoint. The operator must own the Onshape OAuth
+application and is responsible for access review, backups, log retention,
+monitoring, rate limiting, and incident response.
 
 HTTP transport deliberately disables MCP file reads and writes. File-reference
 arguments and local output paths therefore cannot access your computer; provide

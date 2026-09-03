@@ -74,9 +74,61 @@ pub enum ConfigLoadError {
         source: std::io::Error,
     },
 
+    /// A secret-file environment variable did not contain an absolute path.
+    #[error("{variable} must contain an absolute path")]
+    SecretFilePath { variable: &'static str },
+
+    /// A configured secret file could not be read.
+    #[error("Failed to read secret file from {variable} ({path}): {source}")]
+    SecretFileRead {
+        variable: &'static str,
+        path: String,
+        source: std::io::Error,
+    },
+
+    /// A configured secret file was empty.
+    #[error("Secret file from {variable} ({path}) must not be empty")]
+    EmptySecretFile {
+        variable: &'static str,
+        path: String,
+    },
+
     /// Configuration parsing or merging error.
     #[error("Configuration error: {0}")]
     Figment(Box<figment::Error>),
+}
+
+fn read_secret_file(variable: &'static str) -> Result<Option<SecretString>, ConfigLoadError> {
+    let Some(value) = std::env::var_os(variable) else {
+        return Ok(None);
+    };
+    let path =
+        absolute_env_path(Some(value)).ok_or(ConfigLoadError::SecretFilePath { variable })?;
+    check_file_permissions(&path)?;
+    let value =
+        std::fs::read_to_string(&path).map_err(|source| ConfigLoadError::SecretFileRead {
+            variable,
+            path: path.display().to_string(),
+            source,
+        })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ConfigLoadError::EmptySecretFile {
+            variable,
+            path: path.display().to_string(),
+        });
+    }
+    Ok(Some(SecretString::from(value.to_string())))
+}
+
+fn merge_http_secret_files(config: &mut AppConfig) -> Result<(), ConfigLoadError> {
+    if let Some(secret) = read_secret_file("ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET_FILE")? {
+        config.http.onshape_client_secret = Some(secret);
+    }
+    if let Some(key) = read_secret_file("ONSHAPE_MCP_HTTP__STATE_ENCRYPTION_KEY_FILE")? {
+        config.http.state_encryption_key = Some(key);
+    }
+    Ok(())
 }
 
 impl From<figment::Error> for ConfigLoadError {
@@ -243,6 +295,7 @@ fn base_figment(config_path_override: Option<&Path>) -> Result<Figment, ConfigLo
 pub fn load_config(config_path_override: Option<&Path>) -> Result<AppConfig, ConfigLoadError> {
     let figment = base_figment(config_path_override)?;
     let mut config: AppConfig = figment.extract()?;
+    merge_http_secret_files(&mut config)?;
     merge_credentials_from_token_file(&mut config);
     if let Some(original) = config.auth.clamp_check_interval() {
         // TODO: replace eprintln! with tracing::warn! once tracing is available
@@ -279,6 +332,7 @@ pub fn load_config_with_overrides(
     }
 
     let mut config: AppConfig = figment.extract()?;
+    merge_http_secret_files(&mut config)?;
     merge_credentials_from_token_file(&mut config);
     if let Some(original) = config.auth.clamp_check_interval() {
         // TODO: replace eprintln! with tracing::warn! once tracing is available

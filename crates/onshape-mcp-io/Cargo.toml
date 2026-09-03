@@ -11,6 +11,7 @@ keywords = ["mcp", "onshape", "cad", "modelcontextprotocol"]
 categories = ["development-tools"]
 
 [dependencies]
+aes-gcm.workspace = true
 axum.workspace = true
 chrono.workspace = true
 dirs.workspace = true

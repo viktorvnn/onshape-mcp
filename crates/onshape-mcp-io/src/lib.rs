@@ -331,6 +331,8 @@ pub(crate) struct HttpOAuthApiState {
     client: OnshapeClient,
     /// Onshape user ID (key into the shared token store).
     user_id: String,
+    /// Maximum Onshape API access granted to this user.
+    access: onshape_mcp_core::config::AccessLevel,
     /// When the current access token expires, if known.
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Shared OAuth server state (holds client credentials and token store).
@@ -629,6 +631,7 @@ impl OnshapeMcpServer {
             ApiState::HttpOAuth(Box::new(HttpOAuthApiState {
                 client,
                 user_id: user_ctx.user_id.clone(),
+                access: user_ctx.access,
                 expires_at: user_ctx.onshape_tokens.expires_at(),
                 oauth_state: Arc::clone(oauth_state),
                 base_url: self.spec.server_url().to_string(),
@@ -663,7 +666,7 @@ impl OnshapeMcpServer {
 /// are executed. The stdio transport passes `true` for both (local, single-user
 /// process); the HTTP transport passes `false` to prevent network-facing
 /// file-system access.
-#[allow(clippy::significant_drop_tightening)]
+#[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
 async fn dispatch_tool_effect(
     initial_effect: ToolEffect,
     state: &mut ApiState,
@@ -704,7 +707,56 @@ async fn dispatch_tool_effect(
                 request: api_req,
                 continuation,
             } => {
+                let http_audit = match state {
+                    ApiState::HttpOAuth(http_oauth) => {
+                        Some((http_oauth.user_id.clone(), http_oauth.access))
+                    }
+                    _ => None,
+                };
+                if let Some((user_id, access)) = &http_audit
+                    && !access.allows(&api_req.method)
+                {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "onshape_api_request",
+                            "timestamp": chrono::Utc::now(),
+                            "user_id": user_id,
+                            "access": format!("{access:?}").to_lowercase(),
+                            "method": api_req.method.as_str(),
+                            "path": &api_req.path,
+                            "outcome": "denied",
+                        })
+                    );
+                    return Ok(CallToolResult::error(vec![
+                        rmcp::model::ContentBlock::text(format!(
+                            "Access denied: your server role ({:?}) does not permit {} requests. \
+                             Ask the Onshape MCP administrator for a higher access level if this \
+                             operation is required.",
+                            access, api_req.method
+                        )),
+                    ]));
+                }
                 let raw = execute_raw_api_request(state, &api_req).await;
+                if let Some((user_id, access)) = &http_audit {
+                    let (outcome, status) =
+                        raw.as_ref().map_or(("transport_error", None), |response| {
+                            ("completed", Some(response.status))
+                        });
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "onshape_api_request",
+                            "timestamp": chrono::Utc::now(),
+                            "user_id": user_id,
+                            "access": format!("{access:?}").to_lowercase(),
+                            "method": api_req.method.as_str(),
+                            "path": &api_req.path,
+                            "outcome": outcome,
+                            "status": status,
+                        })
+                    );
+                }
                 match raw {
                     Ok(raw) => {
                         update_implicit_validation(validation, raw.status).await;
@@ -1952,6 +2004,15 @@ pub async fn run_http(
                 .into(),
         );
     }
+    let public_host_is_loopback = match parsed_public_url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(host)) => host.is_loopback(),
+        Some(url::Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    };
+    if parsed_public_url.scheme() != "https" && !public_host_is_loopback {
+        return Err("http.public_url must use https:// unless it is a loopback URL".into());
+    }
     // Strip trailing slash from the path for consistent path extension via
     // Url::path_segments_mut().extend().
     let public_url = {
@@ -1970,18 +2031,50 @@ pub async fn run_http(
         .onshape_client_secret
         .clone()
         .ok_or("http.onshape_client_secret is required for the HTTP transport")?;
+    let onshape_company_id = config.http.onshape_company_id.clone();
+    if onshape_company_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err("http.onshape_company_id must not be blank when configured".into());
+    }
 
     let host = config.http.host.clone();
     let port = config.http.port;
 
-    let allowed_user_ids: Vec<String> = config
-        .http
-        .allowed_users
-        .iter()
-        .map(|u| u.id.clone())
-        .collect();
-
-    if allowed_user_ids.is_empty() {
+    if config.http.max_request_body_bytes == 0
+        || config.http.max_registered_clients == 0
+        || config.http.max_pending_authorizations == 0
+    {
+        return Err("HTTP transport capacity limits must be greater than zero".into());
+    }
+    let mut configured_user_ids = std::collections::HashSet::new();
+    for user in &config.http.allowed_users {
+        if user.id.trim().is_empty() {
+            return Err("http.allowed_users entries must have a non-empty id".into());
+        }
+        if !configured_user_ids.insert(user.id.as_str()) {
+            return Err(format!("duplicate http.allowed_users id: {}", user.id).into());
+        }
+    }
+    if config.http.production && config.http.allowed_users.is_empty() {
+        return Err("production HTTP mode requires at least one allowed user".into());
+    }
+    if config.http.production
+        && (config.http.state_file.is_none() || config.http.state_encryption_key.is_none())
+    {
+        return Err("production HTTP mode requires state_file and state_encryption_key".into());
+    }
+    if config.http.production
+        && config
+            .http
+            .state_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("production HTTP mode requires an absolute state_file path".into());
+    }
+    if config.http.allowed_users.is_empty() {
         eprintln!(
             "WARNING: allowed_users is empty — all users will be denied access. \
              Configure allowed_users in the config file or via --allowed-users."
@@ -1997,12 +2090,30 @@ pub async fn run_http(
     let config = Arc::new(config);
     let spec = Arc::new(spec);
     // Build the OAuth server state.
-    let oauth_state = Arc::new(oauth_server::OAuthServerState::new(
+    let oauth_state = oauth_server::OAuthServerState::new(
         public_url.clone(),
         onshape_client_id,
         onshape_client_secret,
-        allowed_user_ids,
-    ));
+        onshape_company_id,
+        config.http.allowed_users.clone(),
+        config.http.max_registered_clients,
+        config.http.max_pending_authorizations,
+    );
+    let oauth_state = match (
+        config.http.state_file.clone(),
+        config.http.state_encryption_key.as_ref(),
+    ) {
+        (Some(path), Some(key)) => {
+            oauth_state.with_encrypted_persistence(path, key.expose_secret())?
+        }
+        (None, None) => oauth_state,
+        _ => {
+            return Err(
+                "http.state_file and http.state_encryption_key must be configured together".into(),
+            );
+        }
+    };
+    let oauth_state = Arc::new(oauth_state);
 
     // Build the MCP service factory.
     //
@@ -2049,7 +2160,17 @@ pub async fn run_http(
             ));
 
     // Build the full app: OAuth routes + protected MCP route.
-    let app = oauth_server::oauth_router(oauth_state).merge(mcp_router);
+    let app = oauth_server::oauth_router(oauth_state)
+        .merge(mcp_router)
+        .layer(axum::extract::DefaultBodyLimit::max(
+            config.http.max_request_body_bytes,
+        ))
+        .layer(
+            tower_http::sensitive_headers::SetSensitiveHeadersLayer::new(std::iter::once(
+                http::header::AUTHORIZATION,
+            )),
+        )
+        .layer(middleware::from_fn(oauth_server::security_headers));
 
     // Bind and serve. Bracket IPv6 hosts to produce valid socket addresses.
     // Normalize by stripping any existing brackets so we don't double-bracket.
@@ -2073,9 +2194,23 @@ pub async fn run_http(
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            // Ignore errors from ctrl_c — if we can't install the handler,
-            // we simply won't have graceful shutdown on Ctrl+C.
-            let _ = tokio::signal::ctrl_c().await;
+            #[cfg(unix)]
+            {
+                if let Ok(mut terminate) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = terminate.recv() => {}
+                    }
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
             cancellation_token.cancel();
         })
         .await?;
@@ -2108,7 +2243,21 @@ mod tests {
             url::Url::parse("https://example.com").expect("valid test URL"),
             "client-id".to_string(),
             SecretString::from("client-secret"),
-            vec!["user-1".to_string(), "user-2".to_string()],
+            None,
+            vec![
+                onshape_mcp_core::config::AllowedUser {
+                    id: "user-1".to_string(),
+                    name: None,
+                    access: onshape_mcp_core::config::AccessLevel::Read,
+                },
+                onshape_mcp_core::config::AllowedUser {
+                    id: "user-2".to_string(),
+                    name: None,
+                    access: onshape_mcp_core::config::AccessLevel::Read,
+                },
+            ],
+            100,
+            100,
         );
 
         let first = state.validation_for_user("user-1").await;

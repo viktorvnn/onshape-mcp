@@ -24,6 +24,7 @@ onshape-mcp-resources = { path = "crates/onshape-mcp-resources", version = "0.5.
 
 # External dependencies
 axum = "0.8"
+aes-gcm = "0.10"
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -47,7 +48,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "signal"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "sensitive-headers"] }
 url = "2"
 proc-macro2 = "1"
 pulldown-cmark = "0.13"

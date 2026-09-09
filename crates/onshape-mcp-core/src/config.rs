@@ -3,6 +3,7 @@
 //! Pure data types and validation for application configuration.
 //! No I/O — config loading is handled by `onshape-mcp-io`.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -94,12 +95,24 @@ pub const DEFAULT_TRANSPORT_HOST: &str = "127.0.0.1";
 /// Default port for the HTTP transport server.
 pub const DEFAULT_TRANSPORT_PORT: u16 = 8080;
 
+/// Default maximum size of one inbound MCP HTTP request (16 MiB).
+pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Default cap for dynamically registered MCP clients.
+pub const DEFAULT_MAX_REGISTERED_CLIENTS: usize = 1_000;
+
+/// Default cap for simultaneous browser authorization flows.
+pub const DEFAULT_MAX_PENDING_AUTHORIZATIONS: usize = 256;
+
 /// HTTP transport configuration.
 ///
 /// Used by the `onshape-mcp http` subcommand to serve the MCP server
 /// over Streamable HTTP with per-user OAuth authentication.
 #[derive(Deserialize)]
 pub struct HttpTransportConfig {
+    /// Enable production safety checks for company-hosted deployments.
+    #[serde(default)]
+    pub production: bool,
     /// Listen address (default: `127.0.0.1`).
     #[serde(default = "default_transport_host")]
     pub host: String,
@@ -118,39 +131,55 @@ pub struct HttpTransportConfig {
     /// Onshape OAuth application client secret.
     #[serde(default)]
     pub onshape_client_secret: Option<SecretString>,
-    /// Allowlist of Onshape user IDs permitted to connect.
-    ///
-    /// Empty list = fail-closed (nobody allowed).
-    ///
-    /// Supports two formats:
-    /// - **TOML array of objects**: `[[http.allowed_users]]` with `id` and optional `name`
-    /// - **Comma-separated string** (e.g. from env vars):
-    ///   `id1:name1,id2:name2` or just `id1,id2` (names are optional)
-    #[serde(default, deserialize_with = "deserialize_allowed_users")]
-    pub allowed_users: Vec<AllowedUser>,
+    /// Optional Onshape enterprise company ID passed during authorization.
+    #[serde(default)]
+    pub onshape_company_id: Option<String>,
+    /// Encrypted OAuth state file used to survive restarts.
+    #[serde(default)]
+    pub state_file: Option<PathBuf>,
+    /// Base64-encoded 256-bit AES key used to encrypt `state_file`.
+    #[serde(default)]
+    pub state_encryption_key: Option<SecretString>,
+    /// Maximum inbound MCP request body size.
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    /// Maximum number of dynamically registered MCP clients.
+    #[serde(default = "default_max_registered_clients")]
+    pub max_registered_clients: usize,
+    /// Maximum number of simultaneous pending authorization flows.
+    #[serde(default = "default_max_pending_authorizations")]
+    pub max_pending_authorizations: usize,
 }
 
 impl Default for HttpTransportConfig {
     fn default() -> Self {
         Self {
+            production: false,
             host: DEFAULT_TRANSPORT_HOST.to_string(),
             port: DEFAULT_TRANSPORT_PORT,
             public_url: None,
             onshape_client_id: None,
             onshape_client_secret: None,
-            allowed_users: Vec::new(),
+            onshape_company_id: None,
+            state_file: None,
+            state_encryption_key: None,
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_registered_clients: DEFAULT_MAX_REGISTERED_CLIENTS,
+            max_pending_authorizations: DEFAULT_MAX_PENDING_AUTHORIZATIONS,
         }
     }
 }
 
-/// An entry in the HTTP transport allowlist.
-#[derive(Deserialize, Clone, Debug)]
-pub struct AllowedUser {
-    /// Onshape user ID (e.g. `6073e74c7f81d1054fca4373`).
-    pub id: String,
-    /// Human-readable name (ignored at runtime, for config readability).
-    #[serde(default)]
-    pub name: Option<String>,
+const fn default_max_request_body_bytes() -> usize {
+    DEFAULT_MAX_REQUEST_BODY_BYTES
+}
+
+const fn default_max_registered_clients() -> usize {
+    DEFAULT_MAX_REGISTERED_CLIENTS
+}
+
+const fn default_max_pending_authorizations() -> usize {
+    DEFAULT_MAX_PENDING_AUTHORIZATIONS
 }
 
 /// Top-level application configuration.
@@ -544,81 +573,6 @@ fn parse_duration_str(s: &str) -> Result<Duration, String> {
     num.checked_mul(multiplier)
         .map(Duration::from_secs)
         .ok_or_else(|| format!("invalid duration \"{s}\": value overflows"))
-}
-
-/// Deserializes `allowed_users` from either a TOML array of objects or a
-/// comma-separated string (useful for environment variables).
-///
-/// String format: `id1:name1,id2:name2` or just `id1,id2`.
-/// The `:name` portion is optional and ignored at runtime.
-fn deserialize_allowed_users<'de, D>(deserializer: D) -> Result<Vec<AllowedUser>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de;
-
-    struct AllowedUsersVisitor;
-
-    impl<'de> de::Visitor<'de> for AllowedUsersVisitor {
-        type Value = Vec<AllowedUser>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(
-                "a list of allowed users (TOML array of {id, name} objects) \
-                 or a comma-separated string like \"id1:name1,id2:name2\"",
-            )
-        }
-
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<AllowedUser>, E> {
-            Ok(parse_allowed_users_csv(value))
-        }
-
-        fn visit_seq<A: de::SeqAccess<'de>>(
-            self,
-            mut seq: A,
-        ) -> Result<Vec<AllowedUser>, A::Error> {
-            let mut users = Vec::new();
-            while let Some(user) = seq.next_element()? {
-                users.push(user);
-            }
-            Ok(users)
-        }
-    }
-
-    deserializer.deserialize_any(AllowedUsersVisitor)
-}
-
-/// Parse a comma-separated string of `id:name` pairs into `AllowedUser` entries.
-///
-/// - Empty or whitespace-only strings produce an empty vec.
-/// - Each entry is trimmed. Empty entries (from trailing commas) are skipped.
-/// - The `:name` portion is optional.
-pub fn parse_allowed_users_csv(s: &str) -> Vec<AllowedUser> {
-    if s.trim().is_empty() {
-        return Vec::new();
-    }
-    s.split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .filter_map(|entry| {
-            if let Some((id, name)) = entry.split_once(':') {
-                let id = id.trim();
-                if id.is_empty() {
-                    return None;
-                }
-                let name = name.trim();
-                Some(AllowedUser {
-                    id: id.to_string(),
-                    name: (!name.is_empty()).then(|| name.to_string()),
-                })
-            } else {
-                Some(AllowedUser {
-                    id: entry.to_string(),
-                    name: None,
-                })
-            }
-        })
-        .collect()
 }
 
 // ============================================================================
@@ -1211,7 +1165,11 @@ mod tests {
         assert!(config.public_url.is_none());
         assert!(config.onshape_client_id.is_none());
         assert!(config.onshape_client_secret.is_none());
-        assert!(config.allowed_users.is_empty());
+        assert!(!config.production);
+        assert_eq!(
+            config.max_request_body_bytes,
+            DEFAULT_MAX_REQUEST_BODY_BYTES
+        );
     }
 
     #[test]
@@ -1223,7 +1181,6 @@ mod tests {
         assert!(config.public_url.is_none());
         assert!(config.onshape_client_id.is_none());
         assert!(config.onshape_client_secret.is_none());
-        assert!(config.allowed_users.is_empty());
     }
 
     #[test]
@@ -1234,7 +1191,7 @@ mod tests {
             public_url = "https://mcp.example.com"
             onshape_client_id = "my-client-id"
             onshape_client_secret = "my-secret"
-            allowed_users = "abc123:Alice,def456:Bob"
+            onshape_company_id = "company-123"
         "#;
         let config: HttpTransportConfig = toml::from_str(toml_str).expect("should deserialize");
         assert_eq!(config.host, "0.0.0.0");
@@ -1244,6 +1201,7 @@ mod tests {
             Some("https://mcp.example.com")
         );
         assert_eq!(config.onshape_client_id.as_deref(), Some("my-client-id"));
+        assert_eq!(config.onshape_company_id.as_deref(), Some("company-123"));
         assert_eq!(
             config
                 .onshape_client_secret
@@ -1251,11 +1209,6 @@ mod tests {
                 .map(|s| s.expose_secret().to_string()),
             Some("my-secret".to_string())
         );
-        assert_eq!(config.allowed_users.len(), 2);
-        assert_eq!(config.allowed_users[0].id, "abc123");
-        assert_eq!(config.allowed_users[0].name.as_deref(), Some("Alice"));
-        assert_eq!(config.allowed_users[1].id, "def456");
-        assert_eq!(config.allowed_users[1].name.as_deref(), Some("Bob"));
     }
 
     #[test]
@@ -1273,24 +1226,6 @@ mod tests {
             config.http.public_url.as_deref(),
             Some("https://example.com")
         );
-    }
-
-    #[test]
-    fn deserialize_http_transport_config_allowed_users_toml_array() {
-        let toml_str = r#"
-            [[allowed_users]]
-            id = "user1"
-            name = "User One"
-
-            [[allowed_users]]
-            id = "user2"
-        "#;
-        let config: HttpTransportConfig = toml::from_str(toml_str).expect("should deserialize");
-        assert_eq!(config.allowed_users.len(), 2);
-        assert_eq!(config.allowed_users[0].id, "user1");
-        assert_eq!(config.allowed_users[0].name.as_deref(), Some("User One"));
-        assert_eq!(config.allowed_users[1].id, "user2");
-        assert!(config.allowed_users[1].name.is_none());
     }
 
     // ====================================================================
@@ -1454,117 +1389,5 @@ mod tests {
         };
         let result = resolve_auth(AuthMethod::OAuth, &inv);
         assert!(matches!(result, ResolvedAuth::OAuthReady { .. }));
-    }
-
-    // ====================================================================
-    // Allowed Users CSV Parsing Tests
-    // ====================================================================
-
-    #[test]
-    fn allowed_users_csv_with_names() {
-        let users = parse_allowed_users_csv("abc123:alice,def456:bob");
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0].id, "abc123");
-        assert_eq!(users[0].name.as_deref(), Some("alice"));
-        assert_eq!(users[1].id, "def456");
-        assert_eq!(users[1].name.as_deref(), Some("bob"));
-    }
-
-    #[test]
-    fn allowed_users_csv_without_names() {
-        let users = parse_allowed_users_csv("abc123,def456");
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0].id, "abc123");
-        assert!(users[0].name.is_none());
-        assert_eq!(users[1].id, "def456");
-        assert!(users[1].name.is_none());
-    }
-
-    #[test]
-    fn allowed_users_csv_mixed() {
-        let users = parse_allowed_users_csv("abc123:alice,def456");
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0].id, "abc123");
-        assert_eq!(users[0].name.as_deref(), Some("alice"));
-        assert_eq!(users[1].id, "def456");
-        assert!(users[1].name.is_none());
-    }
-
-    #[test]
-    fn allowed_users_csv_empty_string() {
-        let users = parse_allowed_users_csv("");
-        assert!(users.is_empty());
-    }
-
-    #[test]
-    fn allowed_users_csv_whitespace_only() {
-        let users = parse_allowed_users_csv("   ");
-        assert!(users.is_empty());
-    }
-
-    #[test]
-    fn allowed_users_csv_with_whitespace() {
-        let users = parse_allowed_users_csv(" abc123 : alice , def456 : bob ");
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0].id, "abc123");
-        assert_eq!(users[0].name.as_deref(), Some("alice"));
-        assert_eq!(users[1].id, "def456");
-        assert_eq!(users[1].name.as_deref(), Some("bob"));
-    }
-
-    #[test]
-    fn allowed_users_csv_trailing_comma() {
-        let users = parse_allowed_users_csv("abc123:alice,");
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].id, "abc123");
-    }
-
-    #[test]
-    fn allowed_users_csv_single_entry() {
-        let users = parse_allowed_users_csv("60a1b2c3d4e5f60708091011:altendky");
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].id, "60a1b2c3d4e5f60708091011");
-        assert_eq!(users[0].name.as_deref(), Some("altendky"));
-    }
-
-    #[test]
-    fn allowed_users_csv_rejects_empty_id_with_name() {
-        // ":somename" has an empty id — should be silently skipped
-        let users = parse_allowed_users_csv(":somename");
-        assert!(users.is_empty());
-    }
-
-    #[test]
-    fn allowed_users_csv_rejects_bare_colon() {
-        // ":" has empty id and empty name — should be silently skipped
-        let users = parse_allowed_users_csv(":");
-        assert!(users.is_empty());
-    }
-
-    #[test]
-    fn allowed_users_csv_rejects_whitespace_colon() {
-        // "  :  " has empty id after trimming — should be silently skipped
-        let users = parse_allowed_users_csv("  :  ");
-        assert!(users.is_empty());
-    }
-
-    #[test]
-    fn allowed_users_csv_skips_empty_id_among_valid() {
-        // Mix of valid and invalid entries — only valid ones survive
-        let users = parse_allowed_users_csv("abc123:alice,:badname,def456");
-        assert_eq!(users.len(), 2);
-        assert_eq!(users[0].id, "abc123");
-        assert_eq!(users[0].name.as_deref(), Some("alice"));
-        assert_eq!(users[1].id, "def456");
-        assert!(users[1].name.is_none());
-    }
-
-    #[test]
-    fn allowed_users_csv_empty_name_becomes_none() {
-        // "abc123:" has a valid id but empty name — name should be None
-        let users = parse_allowed_users_csv("abc123:");
-        assert_eq!(users.len(), 1);
-        assert_eq!(users[0].id, "abc123");
-        assert!(users[0].name.is_none());
     }
 }

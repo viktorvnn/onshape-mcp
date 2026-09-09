@@ -1,0 +1,39 @@
+services:
+  onshape-mcp:
+    build:
+      context: ../..
+    command: ["http"]
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      ONSHAPE_MCP_HTTP__PRODUCTION: "true"
+      ONSHAPE_MCP_HTTP__HOST: "0.0.0.0"
+      ONSHAPE_MCP_HTTP__PORT: "8080"
+      ONSHAPE_MCP_HTTP__PUBLIC_URL: "https://${MCP_DOMAIN:?set MCP_DOMAIN}"
+      ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_ID: "${ONSHAPE_CLIENT_ID:?set ONSHAPE_CLIENT_ID}"
+      ONSHAPE_MCP_HTTP__ONSHAPE_COMPANY_ID: "${ONSHAPE_COMPANY_ID:?set ONSHAPE_COMPANY_ID}"
+      ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET: "${ONSHAPE_CLIENT_SECRET:?set ONSHAPE_CLIENT_SECRET}"
+      ONSHAPE_MCP_HTTP__STATE_FILE: /var/lib/onshape-mcp/oauth-state.enc
+      ONSHAPE_MCP_HTTP__STATE_ENCRYPTION_KEY: "${STATE_ENCRYPTION_KEY:?set STATE_ENCRYPTION_KEY}"
+      ONSHAPE_MCP_HTTP__MAX_REQUEST_BODY_BYTES: "16777216"
+      ONSHAPE_MCP_HTTP__MAX_REGISTERED_CLIENTS: "1000"
+      ONSHAPE_MCP_HTTP__MAX_PENDING_AUTHORIZATIONS: "256"
+    volumes:
+      - oauth-state:/var/lib/onshape-mcp
+    ports:
+      - "${MCP_BIND_IP:?set MCP_BIND_IP}:${MCP_PORT:-42069}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  oauth-state:

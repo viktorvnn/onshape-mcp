@@ -664,7 +664,7 @@ impl OnshapeMcpServer {
 /// are executed. The stdio transport passes `true` for both (local, single-user
 /// process); the HTTP transport passes `false` to prevent network-facing
 /// file-system access.
-#[allow(clippy::significant_drop_tightening)]
+#[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
 async fn dispatch_tool_effect(
     initial_effect: ToolEffect,
     state: &mut ApiState,
@@ -706,7 +706,29 @@ async fn dispatch_tool_effect(
                 continuation,
             } => {
                 let api_req = request::into_onshape_request(api_req);
+                let http_audit_user = match state {
+                    ApiState::HttpOAuth(http_oauth) => Some(http_oauth.user_id.clone()),
+                    _ => None,
+                };
                 let raw = execute_raw_api_request(state, &api_req).await;
+                if let Some(user_id) = &http_audit_user {
+                    let (outcome, status) =
+                        raw.as_ref().map_or(("transport_error", None), |response| {
+                            ("completed", Some(response.status))
+                        });
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "onshape_api_request",
+                            "timestamp": chrono::Utc::now(),
+                            "user_id": user_id,
+                            "method": api_req.method.as_str(),
+                            "path": &api_req.path,
+                            "outcome": outcome,
+                            "status": status,
+                        })
+                    );
+                }
                 match raw {
                     Ok(raw) => {
                         update_implicit_validation(validation, raw.status).await;
@@ -1954,6 +1976,15 @@ pub async fn run_http(
                 .into(),
         );
     }
+    let public_host_is_loopback = match parsed_public_url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(host)) => host.is_loopback(),
+        Some(url::Host::Ipv6(host)) => host.is_loopback(),
+        None => false,
+    };
+    if parsed_public_url.scheme() != "https" && !public_host_is_loopback {
+        return Err("http.public_url must use https:// unless it is a loopback URL".into());
+    }
     // Strip trailing slash from the path for consistent path extension via
     // Url::path_segments_mut().extend().
     let public_url = {
@@ -1972,24 +2003,37 @@ pub async fn run_http(
         .onshape_client_secret
         .clone()
         .ok_or("http.onshape_client_secret is required for the HTTP transport")?;
+    let onshape_company_id = config.http.onshape_company_id.clone();
+    if onshape_company_id
+        .as_deref()
+        .is_some_and(|id| id.trim().is_empty())
+    {
+        return Err("http.onshape_company_id must not be blank when configured".into());
+    }
 
     let host = config.http.host.clone();
     let port = config.http.port;
 
-    let allowed_user_ids: Vec<String> = config
-        .http
-        .allowed_users
-        .iter()
-        .map(|u| u.id.clone())
-        .collect();
-
-    if allowed_user_ids.is_empty() {
-        eprintln!(
-            "WARNING: allowed_users is empty — all users will be denied access. \
-             Configure allowed_users in the config file or via --allowed-users."
-        );
+    if config.http.max_request_body_bytes == 0
+        || config.http.max_registered_clients == 0
+        || config.http.max_pending_authorizations == 0
+    {
+        return Err("HTTP transport capacity limits must be greater than zero".into());
     }
-
+    if config.http.production
+        && (config.http.state_file.is_none() || config.http.state_encryption_key.is_none())
+    {
+        return Err("production HTTP mode requires state_file and state_encryption_key".into());
+    }
+    if config.http.production
+        && config
+            .http
+            .state_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("production HTTP mode requires an absolute state_file path".into());
+    }
     // Build shared state.
     let spec = OpenApiSpec::from_json_with_server_url_fallback(
         OPENAPI_SPEC_JSON,
@@ -1999,12 +2043,29 @@ pub async fn run_http(
     let config = Arc::new(config);
     let spec = Arc::new(spec);
     // Build the OAuth server state.
-    let oauth_state = Arc::new(oauth_server::OAuthServerState::new(
+    let oauth_state = oauth_server::OAuthServerState::new(
         public_url.clone(),
         onshape_client_id,
         onshape_client_secret,
-        allowed_user_ids,
-    ));
+        onshape_company_id,
+        config.http.max_registered_clients,
+        config.http.max_pending_authorizations,
+    );
+    let oauth_state = match (
+        config.http.state_file.clone(),
+        config.http.state_encryption_key.as_ref(),
+    ) {
+        (Some(path), Some(key)) => {
+            oauth_state.with_encrypted_persistence(path, key.expose_secret())?
+        }
+        (None, None) => oauth_state,
+        _ => {
+            return Err(
+                "http.state_file and http.state_encryption_key must be configured together".into(),
+            );
+        }
+    };
+    let oauth_state = Arc::new(oauth_state);
 
     // Build the MCP service factory.
     //
@@ -2051,7 +2112,17 @@ pub async fn run_http(
             ));
 
     // Build the full app: OAuth routes + protected MCP route.
-    let app = oauth_server::oauth_router(oauth_state).merge(mcp_router);
+    let app = oauth_server::oauth_router(oauth_state)
+        .merge(mcp_router)
+        .layer(axum::extract::DefaultBodyLimit::max(
+            config.http.max_request_body_bytes,
+        ))
+        .layer(
+            tower_http::sensitive_headers::SetSensitiveHeadersLayer::new(std::iter::once(
+                http::header::AUTHORIZATION,
+            )),
+        )
+        .layer(middleware::from_fn(oauth_server::security_headers));
 
     // Bind and serve. Bracket IPv6 hosts to produce valid socket addresses.
     // Normalize by stripping any existing brackets so we don't double-bracket.
@@ -2075,9 +2146,23 @@ pub async fn run_http(
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
-            // Ignore errors from ctrl_c — if we can't install the handler,
-            // we simply won't have graceful shutdown on Ctrl+C.
-            let _ = tokio::signal::ctrl_c().await;
+            #[cfg(unix)]
+            {
+                if let Ok(mut terminate) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {}
+                        _ = terminate.recv() => {}
+                    }
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
             cancellation_token.cancel();
         })
         .await?;
@@ -2156,7 +2241,9 @@ mod tests {
             url::Url::parse("https://example.com").expect("valid test URL"),
             "client-id".to_string(),
             SecretString::from("client-secret"),
-            vec!["user-1".to_string(), "user-2".to_string()],
+            None,
+            100,
+            100,
         );
 
         let first = state.validation_for_user("user-1").await;

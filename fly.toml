@@ -7,7 +7,6 @@
 #   4. fly secrets set \
 #        ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_ID=<your-client-id> \
 #        ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET=<your-client-secret> \
-#        "ONSHAPE_MCP_HTTP__ALLOWED_USERS=<id1>:<name1>,<id2>:<name2>"
 #   5. Update Onshape OAuth app redirect URI:
 #        https://onshape.mcp.fstab.net/oauth/callback
 #   6. fly deploy
@@ -29,7 +28,6 @@ ONSHAPE_MCP_HTTP__PUBLIC_URL = "https://onshape.mcp.fstab.net"
 # Secrets (set via `fly secrets set` or the Fly.io dashboard):
 #   ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_ID
 #   ONSHAPE_MCP_HTTP__ONSHAPE_CLIENT_SECRET
-#   ONSHAPE_MCP_HTTP__ALLOWED_USERS  — comma-separated id:name pairs
 
 [http_service]
 internal_port = 8080

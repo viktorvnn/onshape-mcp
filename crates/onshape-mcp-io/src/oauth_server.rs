@@ -460,8 +460,8 @@ pub(crate) enum UserTokenRefreshError {
     HttpClient(String),
 }
 
-/// MCP access token lifetime (1 hour, matching Onshape).
-const TOKEN_LIFETIME_SECS: i64 = 3600;
+/// MCP access token lifetime (30 days).
+const TOKEN_LIFETIME_SECS: i64 = 30 * 24 * 60 * 60;
 
 /// Maximum lifetime of an authorization code (RFC 6749 §4.1.2 recommends ≤10 min).
 const AUTH_CODE_TTL_SECS: i64 = 600;
@@ -2832,6 +2832,7 @@ mod tests {
         assert!(result.is_ok());
         let body = result.expect("should be Ok");
         assert_eq!(body.token_type, "Bearer");
+        assert_eq!(body.expires_in, 30 * 24 * 60 * 60);
         assert!(!body.access_token.is_empty());
         assert!(body.refresh_token.is_some());
     }

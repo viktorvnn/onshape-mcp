@@ -321,7 +321,7 @@ sequenceDiagram
 
     Note over Client,Server: Token exchange (MCP)
     Client->>Server: POST /oauth/token<br>{ grant_type: authorization_code,<br>  code: <mcp_code>,<br>  code_verifier: <client's verifier> }
-    Server-->>Client: { access_token: <mcp_token>,<br>  refresh_token: <mcp_refresh>,<br>  expires_in: 3600 }
+    Server-->>Client: { access_token: <mcp_token>,<br>  refresh_token: <mcp_refresh>,<br>  expires_in: 2592000 }
 ```
 
 ### Steady-State Request

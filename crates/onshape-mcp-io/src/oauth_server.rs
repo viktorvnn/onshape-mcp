@@ -1526,19 +1526,42 @@ async fn token_endpoint(
     State(state): State<Arc<OAuthServerState>>,
     axum::Form(req): axum::Form<TokenRequest>,
 ) -> Result<Json<TokenResponseBody>, (http::StatusCode, Json<serde_json::Value>)> {
+    let grant_type = req.grant_type.as_str();
+    let client_id = req.client_id.as_deref().unwrap_or("<none>");
     eprintln!(
-        "[oauth] token: grant_type={} client_id={:?}",
-        req.grant_type,
-        req.client_id.as_deref().unwrap_or("<none>")
+        "[oauth] token: grant_type={grant_type:?} client_id={client_id:?} received"
     );
-    match req.grant_type.as_str() {
+    let result = match grant_type {
         "authorization_code" => handle_auth_code_grant(&state, &req).await,
         "refresh_token" => handle_refresh_token_grant(&state, &req).await,
         _ => Err(token_error(
             "unsupported_grant_type",
             "Only authorization_code and refresh_token are supported",
         )),
+    };
+
+    match &result {
+        Ok(_) => eprintln!(
+            "[oauth] token: grant_type={grant_type:?} client_id={client_id:?} succeeded"
+        ),
+        Err((status, Json(body))) => {
+            let error = body
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown_error");
+            let description = body
+                .get("error_description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no description");
+            eprintln!(
+                "[oauth] token: grant_type={grant_type:?} client_id={client_id:?} \
+                 failed status={} error={error:?} description={description:?}",
+                status.as_u16()
+            );
+        }
     }
+
+    result
 }
 
 fn validate_client_auth(

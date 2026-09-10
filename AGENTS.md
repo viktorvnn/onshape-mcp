@@ -29,19 +29,28 @@ maintainable solutions over quick geometry that is difficult to edit later.
   configurations, and drawings when the available tools expose them.
 - Create or modify sketches, variables, features, parts, mates, and other
   supported Onshape objects.
-- Use FeatureScript to create geometry, evaluate queries, measure models, and
-  automate repeatable engineering logic.
+- Use FeatureScript only when the request specifically involves FeatureScript,
+  Feature Studios, or reusable custom features.
 - Diagnose regeneration failures, unstable references, under-constrained
   sketches, mate problems, and inefficient feature strategies.
 - Review manufacturability, clearances, tolerances, mass properties, and design
   intent when the model and requirements provide enough evidence.
-- Use the Onshape REST API only for supported operations that are unavailable
-  or unreliable through both MCP servers.
+- Use an agentic browser to operate the Onshape UI when the company MCP server
+  cannot perform the requested task.
+- Use the Onshape REST API only when the task cannot be completed through the
+  company MCP server or the Onshape UI.
 
-## Tool priority
+## Tool selection
 
-Use the following order. Do not skip directly to a lower-priority option merely
-because it is more familiar.
+For normal Onshape work, use this order:
+
+1. Company Onshape MCP server
+2. Agentic browser using the Onshape UI
+3. Onshape REST API
+
+FeatureScript is a specialized path, not a general fallback. Use the official
+Onshape Labs FeatureScript MCP server only when the task itself involves
+FeatureScript.
 
 ### 1. Use the company Onshape MCP server by default
 
@@ -63,10 +72,35 @@ document state. Prefer this server for:
 Use the engineer's authenticated identity. Never ask an engineer to provide
 Onshape client secrets, access tokens, API keys, or authorization headers.
 
-### 2. Use the official Onshape Labs MCP server for FeatureScript
+### 2. Use an agentic browser when the company MCP cannot do the task
 
-For work specifically involving FeatureScript, use the official Onshape Labs
-FeatureScript MCP Server over streamable HTTP:
+If the company MCP server does not expose the required operation, returns an
+unresolved capability error, or cannot verify the result, use the agentic
+browser to perform the work manually in the Onshape UI.
+
+When using the browser:
+
+- Use the engineer's existing authenticated Onshape session. Never request,
+  enter, reveal, or copy passwords, OAuth tokens, API keys, or client secrets.
+- Navigate to the exact document, workspace, element, and configuration before
+  making a change.
+- Inspect the current UI state before acting; do not rely on assumed selections
+  or stale coordinates.
+- Prefer normal Onshape UI actions and preserve the document's existing design
+  intent and naming conventions.
+- Confirm the resulting feature state, geometry, dimensions, or other visible
+  outcome after the operation.
+- Stop and report the limitation if the required control is unavailable or the
+  outcome cannot be verified safely.
+
+Do not switch to REST merely because browser operation takes more steps. REST
+is the final fallback for normal Onshape work.
+
+### 3. Use the official Onshape Labs MCP server only for FeatureScript
+
+For requests specifically involving FeatureScript, Feature Studios, or custom
+features, use the official Onshape Labs FeatureScript MCP Server over
+streamable HTTP:
 
 `https://fs-mcp.labs.onshape.app/mcp`
 
@@ -79,17 +113,28 @@ Prefer it for:
   errors
 - Testing FeatureScript against live Onshape models when supported
 
-For a FeatureScript task, first use the company MCP server when needed to
-establish the target document and model context. Then use the official Onshape
-Labs server for the FeatureScript-specific work. Return to the company server
-for broader model inspection and final verification when applicable.
+Do not use this server for ordinary Part Studio, Assembly, drawing, document,
+or administrative operations merely because the company MCP lacks a tool.
 
-### 3. Use the Onshape REST API as the final fallback
+For a FeatureScript task:
 
-Use the REST API only when both MCP routes lack the required capability, return
-an unresolved error, or the user explicitly requests direct API work. Prefer
-REST operations exposed through the authenticated company MCP server when
-available.
+1. Use the company MCP server to establish document and model context when
+   needed.
+2. Use the official Onshape Labs server for the FeatureScript-specific work.
+3. Use the agentic browser for any required Feature Studio or Onshape UI action
+   that the MCP tools cannot perform.
+4. Use REST only if neither relevant MCP server nor the browser can complete
+   the required operation.
+5. Return to the company MCP server or the browser for final model verification
+   when applicable.
+
+### 4. Use the Onshape REST API as the final fallback
+
+Use the REST API only when the company MCP server and the agentic browser cannot
+complete the requested operation, or when the user explicitly requests direct
+API work. For FeatureScript tasks, also exhaust the relevant capabilities of
+the official FeatureScript MCP server before using REST. Prefer REST operations
+already exposed through the authenticated company MCP server when available.
 
 When using REST:
 

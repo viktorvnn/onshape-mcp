@@ -1144,8 +1144,16 @@ async fn authorize(
     }
 
     let expected_resource = state.url_with_path(&["mcp"]);
-    if params.resource.as_deref() != Some(expected_resource.as_str()) {
-        eprintln!("[oauth] authorize: rejected missing or invalid resource");
+    // Some MCP clients omit the RFC 8707 resource indicator. This server
+    // exposes exactly one protected resource, so a missing value can safely
+    // default to the canonical MCP URL. Explicitly incorrect values are still
+    // rejected to prevent issuing a token for an unintended audience.
+    if params
+        .resource
+        .as_deref()
+        .is_some_and(|resource| resource != expected_resource.as_str())
+    {
+        eprintln!("[oauth] authorize: rejected invalid resource");
         return Err((
             http::StatusCode::BAD_REQUEST,
             format!("resource must be {expected_resource}"),
@@ -1639,7 +1647,11 @@ async fn handle_auth_code_grant(
     validate_client_auth(registered, req.client_secret.as_deref())?;
     drop(clients);
 
-    if req.resource.as_deref() != Some(issued_code.resource.as_str()) {
+    if req
+        .resource
+        .as_deref()
+        .is_some_and(|resource| resource != issued_code.resource.as_str())
+    {
         return Err(token_error("invalid_target", "resource mismatch"));
     }
 
@@ -1765,7 +1777,11 @@ async fn handle_refresh_token_grant(
             "refresh_token not bound to this client",
         ));
     }
-    if req.resource.as_deref() != Some(old_token.resource.as_str()) {
+    if req
+        .resource
+        .as_deref()
+        .is_some_and(|resource| resource != old_token.resource.as_str())
+    {
         return Err(token_error("invalid_target", "resource mismatch"));
     }
 
@@ -2556,7 +2572,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_client_can_exchange_code_with_pkce_and_no_secret() {
+    async fn public_client_can_exchange_code_with_pkce_no_secret_or_resource() {
         use base64::Engine as _;
 
         let state = test_state();
@@ -2604,7 +2620,7 @@ mod tests {
             client_secret: None,
             code_verifier: Some(verifier.to_string()),
             refresh_token: None,
-            resource: Some(state.url_with_path(&["mcp"])),
+            resource: None,
         };
 
         assert!(handle_auth_code_grant(&state, &request).await.is_ok());
@@ -2905,6 +2921,51 @@ mod tests {
     // ================================================================
 
     #[tokio::test]
+    async fn authorize_defaults_missing_resource_to_canonical_mcp_url() {
+        let state = Arc::new(test_state());
+        let (client_id, _) = register_test_client(&state).await;
+
+        let params = AuthorizeParams {
+            response_type: "code".to_string(),
+            client_id,
+            redirect_uri: "https://example.com/callback".to_string(),
+            state: Some("test-state".to_string()),
+            code_challenge: Some("test-challenge".to_string()),
+            code_challenge_method: Some("S256".to_string()),
+            resource: None,
+            scope: None,
+        };
+
+        let _ = authorize(State(state.clone()), Query(params))
+            .await
+            .expect("missing resource should default to the only protected resource");
+
+        let pending = state.pending_auth.read().await;
+        let pending = pending.values().next().expect("pending flow should exist");
+        assert_eq!(pending.resource, state.url_with_path(&["mcp"]));
+    }
+
+    #[tokio::test]
+    async fn authorize_rejects_explicitly_wrong_resource() {
+        let state = Arc::new(test_state());
+        let (client_id, _) = register_test_client(&state).await;
+
+        let params = AuthorizeParams {
+            response_type: "code".to_string(),
+            client_id,
+            redirect_uri: "https://example.com/callback".to_string(),
+            state: Some("test-state".to_string()),
+            code_challenge: Some("test-challenge".to_string()),
+            code_challenge_method: Some("S256".to_string()),
+            resource: Some("https://other.example/mcp".to_string()),
+            scope: None,
+        };
+
+        let result = authorize(State(state), Query(params)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
     async fn authorize_rejects_missing_code_challenge() {
         let state = Arc::new(test_state());
         let (client_id, _) = register_test_client(&state).await;
@@ -3031,7 +3092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_grant_succeeds_with_correct_client() {
+    async fn refresh_grant_succeeds_without_resource_for_correct_client() {
         let state = test_state();
         let (client_id, client_secret) = register_test_client(&state).await;
 
@@ -3063,7 +3124,7 @@ mod tests {
             client_secret: Some(client_secret),
             code_verifier: None,
             refresh_token: Some(refresh_token.clone()),
-            resource: Some(state.url_with_path(&["mcp"])),
+            resource: None,
         };
 
         let result = handle_refresh_token_grant(&state, &req).await;
@@ -3076,6 +3137,47 @@ mod tests {
                 .read()
                 .await
                 .contains_key(&refresh_token)
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_grant_rejects_explicitly_wrong_resource() {
+        let state = test_state();
+        let (client_id, client_secret) = register_test_client(&state).await;
+
+        let refresh_token = random_hex(32);
+        let now = chrono::Utc::now();
+        state.refresh_tokens.write().await.insert(
+            refresh_token.clone(),
+            IssuedToken {
+                user_id: "allowed-user-1".to_string(),
+                client_id: client_id.clone(),
+                resource: state.url_with_path(&["mcp"]),
+                issued_at: now,
+                expires_at: now + chrono::Duration::days(30),
+            },
+        );
+
+        let req = TokenRequest {
+            grant_type: "refresh_token".to_string(),
+            code: None,
+            redirect_uri: None,
+            client_id: Some(client_id),
+            client_secret: Some(client_secret),
+            code_verifier: None,
+            refresh_token: Some(refresh_token.clone()),
+            resource: Some("https://other.example/mcp".to_string()),
+        };
+
+        let result = handle_refresh_token_grant(&state, &req).await;
+        assert!(result.is_err());
+        assert!(
+            state
+                .refresh_tokens
+                .read()
+                .await
+                .contains_key(&refresh_token),
+            "an invalid request must not consume the refresh token"
         );
     }
 
